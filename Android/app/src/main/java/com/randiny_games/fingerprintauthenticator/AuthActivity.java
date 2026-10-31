@@ -17,9 +17,14 @@ import org.json.JSONObject;
 /** Authorizes exactly one fresh challenge, never a reusable authentication token. */
 public final class AuthActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final CancellationSignal cancellation = new CancellationSignal();
+    private CancellationSignal cancellation = new CancellationSignal();
     private String nonce;
     private boolean completed;
+    private boolean persistent;
+    private int attempt;
+    private byte[] payload;
+    private BiometricPrompt prompt;
+    private Results.Pending pending;
     private AuthScreen screen;
 
     private static String field(String value) {
@@ -44,29 +49,23 @@ public final class AuthActivity extends Activity {
         screen = new AuthScreen(this);
         nonce = getIntent().getStringExtra("nonce");
         if (nonce == null || !nonce.matches("[0-9a-f]{64}")) {
+            completed = true;
             finish();
             return;
         }
         try {
-            Results.prepare(nonce);
             String host = field(getIntent().getStringExtra("host"));
             String user = field(getIntent().getStringExtra("user"));
             String service = field(getIntent().getStringExtra("service"));
+            // Old desktop clients keep their bounded behavior during upgrades.
+            persistent = service.equals("kde-fingerprint") &&
+                    "leased-v1".equals(getIntent().getStringExtra("control"));
+            pending = Results.start(nonce, persistent,
+                    () -> runOnUiThread(this::clientClosed), SystemClock.elapsedRealtime());
             screen.context(host, user, service);
-            final byte[] payload = ("pam-android-fingerprint:v2\n" + nonce + "\n" +
+            payload = ("pam-android-fingerprint:v2\n" + nonce + "\n" +
                     host + "\n" + user + "\n" + service + "\n").getBytes(StandardCharsets.US_ASCII);
-            Signature signer = Signature.getInstance("SHA256withECDSA");
-            signer.initSign(Keys.privateKey());
-            screen.status("Touch sensor", Color.rgb(180, 255, 200));
-            final long deadline = SystemClock.elapsedRealtime() + 25000;
-            handler.post(new Runnable() {
-                @Override public void run() {
-                    if (completed) return;
-                    screen.remaining((int) Math.max(0, (deadline - SystemClock.elapsedRealtime() + 999) / 1000));
-                    handler.postDelayed(this, 1000);
-                }
-            });
-            BiometricPrompt prompt = new BiometricPrompt.Builder(this)
+            prompt = new BiometricPrompt.Builder(this)
                     .setTitle(service.equals("pair") ? "Pair this phone with a PC?" : "Computer sign-in")
                     .setSubtitle(user + " @ " + host)
                     .setDescription("Service: " + service + ". Confirm with a strong biometric.")
@@ -74,11 +73,54 @@ public final class AuthActivity extends Activity {
                     .setNegativeButton("Cancel / use PC password", getMainExecutor(),
                             (dialog, which) -> fail("cancelled"))
                     .build();
-            handler.postDelayed(() -> { fail("timeout"); cancellation.cancel(); }, 25000);
+            if (persistent) {
+                screen.waitingForPc();
+                handler.post(new Runnable() {
+                    @Override public void run() {
+                        if (completed) return;
+                        if (!Results.active(pending, SystemClock.elapsedRealtime())) {
+                            clientClosed();
+                            return;
+                        }
+                        handler.postDelayed(this, 500);
+                    }
+                });
+            } else {
+                final long deadline = SystemClock.elapsedRealtime() + 25000;
+                handler.post(new Runnable() {
+                    @Override public void run() {
+                        if (completed) return;
+                        screen.remaining((int) Math.max(0, (deadline - SystemClock.elapsedRealtime() + 999) / 1000));
+                        handler.postDelayed(this, 1000);
+                    }
+                });
+                handler.postDelayed(() -> fail("timeout"), 25000);
+            }
+            startBiometric();
+        } catch (Exception error) { fail(error.getClass().getSimpleName() + ": " + error.getMessage()); }
+    }
+
+    private void startBiometric() {
+        if (completed) return;
+        if (!Results.active(pending, SystemClock.elapsedRealtime())) {
+            clientClosed();
+            return;
+        }
+        try {
+            final int generation = ++attempt;
+            cancellation.cancel();
+            cancellation = new CancellationSignal();
+            Signature signer = Signature.getInstance("SHA256withECDSA");
+            signer.initSign(Keys.privateKey());
+            screen.status("Touch sensor", Color.rgb(180, 255, 200));
             prompt.authenticate(new BiometricPrompt.CryptoObject(signer), cancellation,
                     getMainExecutor(), new BiometricPrompt.AuthenticationCallback() {
                         @Override public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
-                            if (completed) return;
+                            if (completed || generation != attempt) return;
+                            if (!Results.active(pending, SystemClock.elapsedRealtime())) {
+                                clientClosed();
+                                return;
+                            }
                             try {
                                 Signature signature = result.getCryptoObject().getSignature();
                                 signature.update(payload);
@@ -90,13 +132,29 @@ public final class AuthActivity extends Activity {
                             } catch (Exception error) { fail(error.getClass().getSimpleName()); }
                         }
                         @Override public void onAuthenticationError(int code, CharSequence error) {
+                            if (completed || generation != attempt) return;
+                            if (persistent && code == BiometricPrompt.BIOMETRIC_ERROR_TIMEOUT &&
+                                    Results.active(pending, SystemClock.elapsedRealtime())) {
+                                // Hardware operations may time out even though the
+                                // PC request is still alive. Re-arm a NEW per-use
+                                // signing operation, never a cached authorization.
+                                handler.postDelayed(AuthActivity.this::startBiometric, 100);
+                                return;
+                            }
                             fail("biometric_" + code + ": " + error);
                         }
                         @Override public void onAuthenticationFailed() {
-                            screen.status("Try again", Color.rgb(255, 210, 100));
+                            if (!completed && generation == attempt)
+                                screen.status("Try again", Color.rgb(255, 210, 100));
                         }
                     });
         } catch (Exception error) { fail(error.getClass().getSimpleName() + ": " + error.getMessage()); }
+    }
+
+    private void clientClosed() {
+        if (!completed) fail("request_closed");
+        cancellation.cancel();
+        finish();
     }
 
     private void fail(String error) {
@@ -112,8 +170,9 @@ public final class AuthActivity extends Activity {
         if (completed) return;
         completed = true;
         handler.removeCallbacksAndMessages(null);
-        Results.complete(nonce, response.toString());
-        screen.result(!response.has("error"));
+        cancellation.cancel();
+        boolean published = Results.complete(pending, response.toString());
+        screen.result(published && !response.has("error"));
         // Publish the result immediately, but keep the small physical display
         // confirmation visible briefly. No signature can be reused afterward.
         handler.postDelayed(this::finish, 1400);

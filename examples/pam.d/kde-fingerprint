@@ -1,0 +1,20 @@
+#%PAM-1.0
+# Example for KDE's dedicated noninteractive fingerprint authenticator.
+# Review against your distribution's vendor profile before installation.
+# Allow kde-fingerprint (not kde) in the phone registry to avoid duplicate prompts.
+
+auth requisite pam_shells.so
+auth requisite pam_nologin.so
+auth requisite pam_faillock.so preauth
+auth requisite pam_exec.so quiet quiet_log seteuid stdout /usr/bin/python3 -I /usr/local/libexec/pam-android-fingerprint authenticate
+auth required pam_env.so
+auth required pam_faillock.so authsucc
+
+# Only an authenticated phone clears the failure tally. Cancellation, timeout
+# and offline phones fail this branch without recording a PC password failure;
+# the separate kde password branch keeps its existing authfail handling.
+# The phone itself enforces biometric retry limits and lockout.
+
+account include system-local-login
+password required pam_deny.so
+session include system-local-login

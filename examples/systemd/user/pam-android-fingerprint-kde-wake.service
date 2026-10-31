@@ -1,0 +1,13 @@
+[Unit]
+Description=Wake KDE Wayland displays after screen unlock
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I %h/.local/libexec/pam-android-fingerprint-kde-wake.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

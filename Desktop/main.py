@@ -10,7 +10,9 @@ from pathlib import Path
 import pwd
 import re
 import secrets
+import select
 import selectors
+import signal
 import socket
 import stat
 import subprocess
@@ -29,6 +31,70 @@ DEVICE = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 NONCE = re.compile(r"[0-9a-f]{64}\Z")
 ENV = {"PATH": "/usr/bin:/bin", "LANG": "C"}
 MAX_DEVICES = 8
+SSH_HINTS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
+MAX_CALLER_ENV = 65536
+
+
+class RequestCancelled(ValueError):
+    pass
+
+
+class RequestLifetime:
+    """Cancel on signals/PAM-owner death; the stdout pipe also covers early orphaning."""
+    def __init__(self, watch_parent=False):
+        self.watch_parent = watch_parent
+        self.parent = os.getppid()
+        self.cancelled = False
+        self.poll = select.poll()
+        self.fds = []
+        self.pipe_fd = None
+        self.handlers = {}
+
+    def __enter__(self):
+        try:
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                self.handlers[signum] = signal.signal(signum, self._signal)
+            if self.watch_parent:
+                if stat.S_ISFIFO(os.fstat(1).st_mode):
+                    self.pipe_fd = os.dup(1)
+                    self.fds.append(self.pipe_fd)
+                    self.poll.register(self.pipe_fd, select.POLLERR | select.POLLHUP)
+                if hasattr(os, "pidfd_open"):
+                    try:
+                        descriptor = os.pidfd_open(self.parent)
+                    except OSError:
+                        descriptor = None
+                    if descriptor is not None:
+                        self.fds.append(descriptor)
+                        self.poll.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
+            self.check()
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def _signal(self, signum, frame):
+        self.cancelled = True
+
+    def check(self):
+        if (self.cancelled or self.poll.poll(0) or
+                self.watch_parent and os.getppid() != self.parent):
+            raise RequestCancelled("Authentication request was cancelled")
+
+    def require_pam_pipe(self):
+        if self.pipe_fd is None:
+            raise ValueError("Persistent PAM authentication requires pam_exec stdout")
+        self.check()
+
+    def __exit__(self, *args):
+        for signum, previous in self.handlers.items():
+            signal.signal(signum, previous)
+        self.handlers.clear()
+        for descriptor in self.fds:
+            self.poll.unregister(descriptor)
+            os.close(descriptor)
+        self.fds.clear()
+        self.pipe_fd = None
 
 
 def field(value):
@@ -89,8 +155,10 @@ def verify_signature(response, nonce, host, user, service, der, key):
     return der
 
 
-def adb(device, *args, timeout=4):
+def adb(device, *args, timeout=4, lifetime=None, on_tick=None, deadline_check=None):
     # Never start an ADB server as root or inherit caller-controlled ADB settings.
+    if lifetime is not None:
+        lifetime.check()
     with socket.create_connection(("127.0.0.1", 5037), timeout=1):
         pass
     command = ["/usr/bin/adb", "-H", "127.0.0.1", "-P", "5037"]
@@ -107,16 +175,33 @@ def adb(device, *args, timeout=4):
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
         output = bytearray()
         sizes = {process.stdout: 0, process.stderr: 0}
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
+        next_tick = time.monotonic() + 2 if on_tick is not None else None
         try:
             with selectors.DefaultSelector() as selector:
                 for stream in sizes:
                     selector.register(stream, selectors.EVENT_READ)
                 while selector.get_map():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
+                    if lifetime is not None:
+                        lifetime.check()
+                    if deadline_check is not None:
+                        deadline_check()
+                    now = time.monotonic()
+                    if next_tick is not None and now >= next_tick:
+                        on_tick()
+                        next_tick = time.monotonic() + 2
+                        now = time.monotonic()
+                    remaining = None if deadline is None else deadline - now
+                    if remaining is not None and remaining <= 0:
                         raise subprocess.TimeoutExpired(command, timeout)
-                    for event, _ in selector.select(remaining):
+                    wait = 2 if remaining is None else remaining
+                    if next_tick is not None:
+                        wait = min(wait, max(0, next_tick - now))
+                    if lifetime is not None:
+                        wait = min(wait, 0.2)
+                    for event, _ in selector.select(wait):
+                        if deadline_check is not None:
+                            deadline_check()
                         chunk = os.read(event.fileobj.fileno(), 4096)
                         if not chunk:
                             selector.unregister(event.fileobj)
@@ -126,7 +211,12 @@ def adb(device, *args, timeout=4):
                             raise ValueError("Oversized ADB response")
                         if event.fileobj is process.stdout:
                             output.extend(chunk)
-            returncode = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+            returncode = process.wait(timeout=2 if deadline is None else
+                                      max(0.01, deadline - time.monotonic()))
+            if lifetime is not None:
+                lifetime.check()
+            if deadline_check is not None:
+                deadline_check()
             if returncode:
                 raise subprocess.CalledProcessError(returncode, command)
             return bytes(output)
@@ -187,29 +277,103 @@ def load_config(path, trusted=False):
     return validate_config(json.loads(data))
 
 
-def request_response(device, transport, host, user, service):
+def control(transport, operation, nonce, lifetime=None):
+    raw = adb(transport, "exec-out", "content", "read", "--uri",
+              f"content://{PACKAGE}.results/{operation}/{nonce}",
+              timeout=2, lifetime=lifetime)
+    response = json.loads(raw)
+    if (not isinstance(response, dict) or response.get("nonce") != nonce or
+            response.get("protocol") != "leased-v1"):
+        raise ValueError("Phone does not support request lifecycle control")
+    return response
+
+
+class RequestLease:
+    def __init__(self, transport, nonce, lifetime):
+        self.transport, self.nonce, self.lifetime = transport, nonce, lifetime
+        self.ended_deadline = None
+
+    def check(self):
+        if self.ended_deadline is not None and time.monotonic() >= self.ended_deadline:
+            raise RequestCancelled("Phone request ended without a result")
+
+    def renew(self, required=False):
+        self.check()
+        response = control(self.transport, "lease", self.nonce, self.lifetime)
+        if type(response.get("alive")) is not bool:
+            raise ValueError("Invalid request lease response")
+        state = response.get("state")
+        if state in ("pending", "complete"):
+            if not response["alive"] or self.ended_deadline is not None:
+                raise ValueError("Inconsistent request lease state")
+        elif state == "consumed":
+            if response["alive"]:
+                raise ValueError("Inconsistent consumed result")
+            if required:
+                raise ValueError("Phone request is not active")
+            # The provider may have consumed its result before those final bytes
+            # reach this ADB client. Allow only a short transport-drain grace.
+            if self.ended_deadline is None:
+                self.ended_deadline = time.monotonic() + 4
+        elif state in ("cancelled", "unknown"):
+            raise RequestCancelled("Phone request is no longer active")
+        else:
+            raise ValueError("Unknown request lease state")
+        self.check()
+
+
+def request_response(device, transport, host, user, service, lifetime=None):
+    if lifetime is None:
+        with RequestLifetime() as owned:
+            return request_response(device, transport, host, user, service, owned)
     field(service)
-    serial = adb(transport, "shell", "getprop", "ro.serialno", timeout=2).decode().strip()
+    persistent = service == "kde-fingerprint"
+    if persistent and lifetime.watch_parent:
+        lifetime.require_pam_pipe()
+    serial = adb(transport, "shell", "getprop", "ro.serialno",
+                 timeout=2, lifetime=lifetime).decode().strip()
     if serial != device["serial"]:
         raise ValueError("Connected device is not the selected paired phone")
     nonce = secrets.token_hex(32)
-    adb(transport, "shell", "am", "start", "-W", "-n",
-        PACKAGE + "/.AuthActivity", "--es", "nonce", nonce,
-        "--es", "host", field(host), "--es", "user", field(user),
-        "--es", "service", service, timeout=8)
-    raw = adb(transport, "exec-out", "content", "read", "--uri",
-              f"content://{PACKAGE}.results/result/{nonce}", timeout=30)
-    return json.loads(raw), nonce
+    finished = False
+    try:
+        extra = ("--es", "control", "leased-v1") if persistent else ()
+        adb(transport, "shell", "am", "start", "-W", "-n",
+            PACKAGE + "/.AuthActivity", "--es", "nonce", nonce,
+            "--es", "host", field(host), "--es", "user", field(user),
+            "--es", "service", service, *extra, timeout=8, lifetime=lifetime)
+        lease = RequestLease(transport, nonce, lifetime) if persistent else None
+        if lease is not None:
+            lease.renew(required=True)
+        raw = adb(transport, "exec-out", "content", "read", "--uri",
+                  f"content://{PACKAGE}.results/result/{nonce}",
+                  timeout=None if persistent else 30, lifetime=lifetime,
+                  on_tick=lease.renew if lease is not None else None,
+                  deadline_check=lease.check if lease is not None else None)
+        response = json.loads(raw)
+        if lease is not None:
+            lease.check()
+        lifetime.check()
+        finished = True
+        return response, nonce
+    finally:
+        if not finished:
+            # Cleanup must still run after the lifetime itself is cancelled.
+            # If ADB is unavailable, the Android lease is the final safety net.
+            try:
+                control(transport, "cancel", nonce)
+            except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+                pass
 
 
-def choose_device(config, label=None):
+def choose_device(config, label=None, lifetime=None):
     """Use the first available paired identity; never prompt an unknown phone."""
     devices = config["devices"]
     if label is not None:
         devices = [device for device in devices if device["label"] == label]
         if not devices:
             raise ValueError("Unknown phone label")
-    output = adb(None, "devices", timeout=2).decode()
+    output = adb(None, "devices", timeout=2, lifetime=lifetime).decode()
     connected = []
     for line in output.splitlines():
         parts = line.split()
@@ -228,7 +392,9 @@ def choose_device(config, label=None):
             if endpoint not in serials:
                 try:
                     serials[endpoint] = adb(endpoint, "shell", "getprop",
-                                            "ro.serialno", timeout=2).decode().strip()
+                                            "ro.serialno", timeout=2, lifetime=lifetime).decode().strip()
+                except RequestCancelled:
+                    raise
                 except (OSError, ValueError, subprocess.SubprocessError):
                     serials[endpoint] = None
             if serials[endpoint] == device["serial"]:
@@ -236,9 +402,11 @@ def choose_device(config, label=None):
     raise ValueError("No paired phone is connected")
 
 
-def request(config, service, label=None):
-    device, endpoint = choose_device(config, label)
-    response, nonce = request_response(device, endpoint, config["host"], config["user"], service)
+def request(config, service, label=None, lifetime=None):
+    device, endpoint = choose_device(config, label, lifetime)
+    response, nonce = request_response(device, endpoint, config["host"], config["user"], service, lifetime)
+    if lifetime is not None:
+        lifetime.check()
     return verify(response, nonce, config["host"], config["user"], service, device["public_key"])
 
 
@@ -273,6 +441,30 @@ def save_pairing(path, config, add=False, expected=None):
                 temporary.unlink(missing_ok=True)
 
 
+def ssh_hint_present():
+    """Best-effort UX hint: skip phone waiting, never authorize anything.
+
+    pam_exec builds its child's environment from the PAM environment, which
+    normally omits SSH_*. Its immediate parent is the PAM caller (e.g. sudo);
+    Linux exposes that process's initial environment through procfs. No
+    ancestor walking, process-name matching or sudoers env_keep is needed.
+    Missing hints, inaccessible procfs or oversized data mean "unknown", not
+    proof of locality. A user can remove/spoof hints or delegate to a daemon.
+    """
+    if any(os.environ.get(name) for name in SSH_HINTS):
+        return True
+    try:
+        with open(f"/proc/{os.getppid()}/environ", "rb") as source:
+            data = source.read(MAX_CALLER_ENV + 1)
+    except OSError:
+        return False
+    if len(data) > MAX_CALLER_ENV:
+        return False
+    prefixes = tuple((name + "=").encode("ascii") for name in SSH_HINTS)
+    return any(entry.startswith(prefix) and len(entry) > len(prefix)
+               for entry in data.split(b"\0") for prefix in prefixes)
+
+
 def authenticate():
     config = load_config(CONFIG, trusted=True)
     if (os.environ.get("PAM_TYPE") != "auth" or
@@ -280,7 +472,12 @@ def authenticate():
             os.environ.get("PAM_SERVICE") not in config["services"] or
             os.environ.get("PAM_RHOST", "")):
         return 1
-    request(config, os.environ["PAM_SERVICE"])
+    if os.environ["PAM_SERVICE"] in ("sudo", "sudo-i") and ssh_hint_present():
+        # Nonzero -> pam_exec default=ignore -> the existing password path.
+        return 1
+    with RequestLifetime(watch_parent=True) as lifetime:
+        request(config, os.environ["PAM_SERVICE"], lifetime=lifetime)
+        lifetime.check()
     return 0
 
 
@@ -294,7 +491,7 @@ def main():
     pair.add_argument("--label", required=True)
     pair.add_argument("--user", required=True)
     pair.add_argument("--host", required=True)
-    pair.add_argument("--services", default="sudo,sudo-i,kde,polkit-1")
+    pair.add_argument("--services", default="sudo,sudo-i,kde-fingerprint,polkit-1")
     pair.add_argument("--output", required=True)
     pair.add_argument("--add", action="store_true", help="Add another phone to an existing pairing file")
     trust = pair.add_mutually_exclusive_group(required=True)
@@ -305,6 +502,7 @@ def main():
     test = commands.add_parser("test")
     test.add_argument("--config", required=True)
     test.add_argument("--phone", help="Select an enrolled label; otherwise use the first connected phone")
+    test.add_argument("--service", help="Test an allowlisted service; defaults to the first service")
     args = parser.parse_args()
     if args.command == "authenticate":
         return authenticate()
@@ -347,9 +545,13 @@ def main():
         print("Paired key SHA256:", hashlib.sha256(der).hexdigest())
     elif args.command == "test":
         config = load_config(args.config)
+        service = args.service or config["services"][0]
+        if service not in config["services"]:
+            raise ValueError("Test service is not allowlisted")
         print("Touch the selected phone's fingerprint sensor.", flush=True)
-        request(config, config["services"][0], args.phone)
-        print("Verified: signature from the selected paired phone.")
+        started = time.monotonic()
+        request(config, service, args.phone)
+        print(f"Verified: signature from the selected paired phone ({time.monotonic() - started:.1f} s).")
     return 0
 
 

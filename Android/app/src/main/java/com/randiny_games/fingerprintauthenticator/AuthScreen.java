@@ -118,6 +118,10 @@ final class AuthScreen {
         remaining.setText(seconds + " s");
     }
 
+    void waitingForPc() {
+        remaining.setText("Until PC unlock");
+    }
+
     void result(boolean success) {
         status(success ? "Confirmed" : "Cancelled",
                 success ? Color.rgb(130, 255, 170) : Color.rgb(255, 190, 110));
