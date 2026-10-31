@@ -45,8 +45,25 @@ check fails, stop rather than relaxing the hardware or authorization checks.
 
 ## Pair a phone
 
-Read its 64-character lowercase **Key SHA256** directly from the physical phone
-screen, independently of ADB. Substitute your own values:
+Read its **Key SHA256** directly from the physical phone screen, independently
+of ADB. The 64 hex characters are displayed in eight-character groups joined
+by `-` for manual comparison. **Copy SHA256** and **Share SHA256** are available
+before pairing, after the hardware key readiness check succeeds. They transfer
+only that public-key digest in the displayed hyphenated format, never a private
+key or biometric data.
+Each button asks for confirmation; sharing opens Android's app chooser, where
+you can select KDE Connect or another installed app.
+
+The phone also colors digits blue, `a/e` amber and `b/c/d/f` purple, with lighter
+shades for higher symbols within each group. Colors are an optional visual cue,
+not verification data: the complete text stays visible and Copy/Share contain
+plain text only. The fingerprint panel uses a fixed light background and colors
+tested for at least 4.5:1 text contrast.
+
+The digest is public, but its integrity matters during pairing. Sending it
+through another app trusts that transfer channel; it is not hardware attestation.
+Sending it through the same potentially compromised ADB channel is not
+independent verification. Substitute your own values:
 
 ```sh
 python3 -I Desktop/main.py pair \
@@ -55,6 +72,14 @@ python3 -I Desktop/main.py pair \
   --expect-fingerprint PHONE_SCREEN_SHA256 \
   --output build/pairing.json
 ```
+
+`--expect-fingerprint` accepts either 64 consecutive hex characters or exactly
+eight groups of eight hex characters joined by `-`, matching the phone's
+display and Copy/Share payload. Upper-case hex is also accepted. Hyphenated
+input needs no shell quoting. Spaces, colons, line breaks, other separators and
+misplaced hyphens are rejected. The helper removes the seven hyphens before
+comparing the complete 64-character digest. Protocol nonces and the cryptographic
+key comparison remain strict and unchanged.
 
 `PHONE_TRANSPORT` is an already connected entry from `adb devices`, such as a USB
 serial or wireless address. Pairing verifies the serial, a fresh biometric-backed

@@ -103,6 +103,15 @@ def field(value):
     return value
 
 
+def normalize_fingerprint(value):
+    """Normalize only the human-entered public-key digest, never protocol nonces."""
+    if (not isinstance(value, str) or len(value) not in (64, 71) or
+            re.fullmatch(r"(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{8}){7})",
+                         value) is None):
+        raise ValueError("Expected 64 hex digits, compact or eight 8-digit groups joined by '-'")
+    return value.replace("-", "").lower()
+
+
 def message(nonce, host, user, service):
     if not NONCE.fullmatch(nonce):
         raise ValueError("Invalid nonce")
@@ -132,8 +141,7 @@ def verify(response, nonce, host, user, service, pinned):
 def verify_pairing(response, nonce, host, user, service, expected_fingerprint):
     # The expected fingerprint must be read from the physical phone screen,
     # independently of ADB. Self-signed responses alone cannot establish identity.
-    if not isinstance(expected_fingerprint, str) or not NONCE.fullmatch(expected_fingerprint):
-        raise ValueError("Expected phone key SHA256 must contain 64 lowercase hex digits")
+    expected_fingerprint = normalize_fingerprint(expected_fingerprint)
     check_response(response, nonce)
     der, key = public_key(response["public_key"])
     if not secrets.compare_digest(hashlib.sha256(der).hexdigest(), expected_fingerprint):
@@ -495,8 +503,8 @@ def main():
     pair.add_argument("--output", required=True)
     pair.add_argument("--add", action="store_true", help="Add another phone to an existing pairing file")
     trust = pair.add_mutually_exclusive_group(required=True)
-    trust.add_argument("--expect-fingerprint",
-                      help="SHA256 shown on the physical phone screen (not obtained via ADB)")
+    trust.add_argument("--expect-fingerprint", type=normalize_fingerprint,
+                      help="Phone key SHA256: 64 hex digits or eight 8-digit groups joined by '-'")
     trust.add_argument("--trust-adb", action="store_true",
                        help="Explicit first-use trust in this ADB channel; not independent key verification")
     test = commands.add_parser("test")
@@ -512,8 +520,6 @@ def main():
         field(args.serial)
         field(args.user)
         field(args.host)
-        if args.expect_fingerprint is not None and not NONCE.fullmatch(args.expect_fingerprint):
-            raise ValueError("Expected phone key SHA256 must contain 64 lowercase hex digits")
         if args.add:
             config = load_config(args.output)
             expected = json.loads(json.dumps(config))

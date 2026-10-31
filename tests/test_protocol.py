@@ -59,6 +59,68 @@ class ProtocolTests(unittest.TestCase):
             self.response, self.nonce, "workstation", "alice", "sudo",
             hashlib.sha256(self.der).hexdigest()), self.der)
 
+    def test_pairing_accepts_grouped_fingerprint_and_uppercase(self):
+        fingerprint = hashlib.sha256(self.der).hexdigest()
+        groups = [fingerprint[i:i + 8].upper() for i in range(0, 64, 8)]
+        for grouped in ("-".join(groups), fingerprint.upper(), fingerprint):
+            with self.subTest(grouped=grouped):
+                self.assertEqual(app.normalize_fingerprint(grouped), fingerprint)
+                self.assertEqual(app.verify_pairing(
+                    self.response, self.nonce, "workstation", "alice", "sudo", grouped), self.der)
+        wrong = "-".join(["00000000"] * 8)
+        with self.assertRaises(ValueError):
+            app.verify_pairing(self.response, self.nonce, "workstation", "alice", "sudo", wrong)
+
+    def test_fingerprint_normalization_rejects_other_characters_and_lengths(self):
+        valid = "ab" * 32
+        groups = [valid[i:i + 8] for i in range(0, 64, 8)]
+        for value in (None, b"ab" * 32, "", valid[:-1], valid + "0", "-" * 64,
+                      valid + "g", valid + "_", valid + "\0", "SHA256:" + valid,
+                      valid + "\u00a0", valid + "\u200b", valid + "\u2010",
+                      valid + " " * 257, " ".join(groups), ":".join(groups),
+                      "\n".join(groups), "\t".join(groups), "\r\n" + valid,
+                      "-" + valid, valid + "-", "--".join(groups),
+                      "-".join(valid[i:i + 4] for i in range(0, 64, 4)),
+                      valid[:7] + "-" + valid[7:],
+                      "-".join(groups) + "\n"):
+            with self.subTest(value=repr(value)), self.assertRaises(ValueError):
+                app.normalize_fingerprint(value)
+        self.assertEqual(app.normalize_fingerprint(valid.upper()), valid)
+
+    def test_fingerprint_separator_support_does_not_relax_protocol_nonce(self):
+        grouped = "-".join([self.nonce[i:i + 8] for i in range(0, 64, 8)])
+        for nonce in (grouped, self.nonce.upper()):
+            with self.assertRaises(ValueError):
+                app.message(nonce, "workstation", "alice", "sudo")
+
+    def test_cli_normalizes_fingerprint_before_request(self):
+        fingerprint = hashlib.sha256(self.der).hexdigest()
+        grouped = "-".join(fingerprint[i:i + 8].upper() for i in range(0, 64, 8))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(app.sys, "argv", [
+                    "helper", "pair", "--device", "test", "--serial", "TEST_PHONE_A",
+                    "--label", "primary", "--user", "alice", "--host", "workstation",
+                    "--expect-fingerprint", grouped, "--output", str(Path(directory) / "pair.json")]), \
+                patch.object(app, "request_response", return_value=(self.response, self.nonce)), \
+                patch.object(app, "verify_pairing", return_value=self.der) as verify_pairing, \
+                patch.object(app, "save_pairing"), \
+                patch("builtins.print"):
+            self.assertEqual(app.main(), 0)
+            verify_pairing.assert_called_once_with(
+                self.response, self.nonce, "workstation", "alice", "pair", fingerprint)
+
+    def test_cli_rejects_malformed_fingerprint_before_phone_access(self):
+        with patch.object(app.sys, "argv", [
+                "helper", "pair", "--device", "test", "--serial", "TEST_PHONE_A",
+                "--label", "primary", "--user", "alice", "--host", "workstation",
+                "--expect-fingerprint", "ab" * 31, "--output", "unused.json"]), \
+                patch.object(app, "request_response") as request, \
+                patch.object(app.sys, "stderr"):
+            with self.assertRaises(SystemExit) as exit:
+                app.main()
+            self.assertEqual(exit.exception.code, 2)
+            request.assert_not_called()
+
     def test_null_configuration_pin(self):
         config = copy.deepcopy(self.config)
         config["devices"][0]["public_key"] = None
