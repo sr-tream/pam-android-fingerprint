@@ -1,155 +1,128 @@
 package com.randiny_games.fingerprintauthenticator;
 
-import android.content.BroadcastReceiver;
-import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
+import android.app.Activity;
+import android.graphics.Color;
+import android.hardware.biometrics.BiometricManager;
+import android.hardware.biometrics.BiometricPrompt;
 import android.os.Bundle;
-import android.os.PowerManager;
-import android.support.annotation.Nullable;
-import android.support.v7.app.AppCompatActivity;
-import android.view.View;
-import android.view.WindowManager;
-import android.widget.Button;
-import android.widget.TextView;
-import android.widget.Toast;
+import android.os.CancellationSignal;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
+import android.util.Base64;
+import java.nio.charset.StandardCharsets;
+import java.security.Signature;
+import org.json.JSONObject;
 
-import com.jesusm.kfingerprintmanager.KFingerprintManager;
+/** Authorizes exactly one fresh challenge, never a reusable authentication token. */
+public final class AuthActivity extends Activity {
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final CancellationSignal cancellation = new CancellationSignal();
+    private String nonce;
+    private boolean completed;
+    private AuthScreen screen;
 
-import org.jetbrains.annotations.NotNull;
-
-import de.adorsys.android.securestoragelibrary.SecurePreferences;
-
-public class AuthActivity extends AppCompatActivity implements View.OnClickListener {
-
-    private Button authButton;
-    private KFingerprintManager fm;
-    private TextView status;
-
-    private Boolean registered;
-
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-
-        setContentView(R.layout.activity_auth);
-        authButton = (Button) findViewById(R.id.authButton);
-        status = (TextView) findViewById(R.id.authDesc);
-
-        authButton.setOnClickListener(this);
-        authButton.setEnabled(false);
-
-        fm = new KFingerprintManager(this,"fingerprintPam");
-
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
-                | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-                | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
-                | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
-
-        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-        boolean isScreenOn = pm.isInteractive();
-
-        registered = false;
-
-        if(isScreenOn){
-            attemptDecrypt();
-        }else {
-            IntentFilter filter = new IntentFilter();
-            filter.addAction(Intent.ACTION_SCREEN_ON);
-            registerReceiver(screenCheck, filter);
-            registered = true;
-        }
-
-
+    private static String field(String value) {
+        if (value == null || !value.matches("[A-Za-z0-9_.@-]{1,64}"))
+            throw new IllegalArgumentException("Invalid request context");
+        return value;
     }
 
-    private final BroadcastReceiver screenCheck = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            attemptDecrypt();
-
-            unregisterReceiver(screenCheck);
-            registered = false;
+    @Override public void onCreate(Bundle state) {
+        super.onCreate(state);
+        if (state != null) {
+            // The destroyed instance has already failed or completed this
+            // operation. Never resurrect its nonce after a configuration change.
+            completed = true;
+            finish();
+            return;
         }
-    };
-
-    private void attemptDecrypt(){
-
-        String encData = SecurePreferences.getStringValue("secret","");
-
-        SecurePreferences.removeValue("decryptedKey");
-
-        if(encData.equals("")){
-            failAuth();
+        setShowWhenLocked(true);
+        setTurnScreenOn(true);
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON |
+                             android.view.WindowManager.LayoutParams.FLAG_SECURE);
+        screen = new AuthScreen(this);
+        nonce = getIntent().getStringExtra("nonce");
+        if (nonce == null || !nonce.matches("[0-9a-f]{64}")) {
+            finish();
+            return;
         }
-
-        fm.decrypt(encData, new KFingerprintManager.DecryptionCallback() {
-            @Override
-            public void onDecryptionSuccess(@NotNull String messageDecrypted) {
-                SecurePreferences.setValue("decryptedKey",messageDecrypted);
-                returnToServer();
-            }
-
-            @Override
-            public void onDecryptionFailed() {
-                status.setText(R.string.statusFailDecryption);
-                failAuth();
-            }
-
-            @Override
-            public void onFingerprintNotRecognized() {
-                status.setText(R.string.statusFailNotRecognized);
-                authButton.setEnabled(true);
-            }
-
-            @Override
-            public void onAuthenticationFailedWithHelp(@Nullable String help) {
-                status.setText(help);
-                authButton.setEnabled(true);
-            }
-
-            @Override
-            public void onFingerprintNotAvailable() {
-                status.setText(R.string.statusFailNotAvailable);
-                failAuth();
-            }
-
-            @Override
-            public void onCancelled() {
-                status.setText(R.string.statusCanceled);
-                authButton.setEnabled(true);
-            }
-        }, getSupportFragmentManager());
+        try {
+            Results.prepare(nonce);
+            String host = field(getIntent().getStringExtra("host"));
+            String user = field(getIntent().getStringExtra("user"));
+            String service = field(getIntent().getStringExtra("service"));
+            screen.context(host, user, service);
+            final byte[] payload = ("pam-android-fingerprint:v2\n" + nonce + "\n" +
+                    host + "\n" + user + "\n" + service + "\n").getBytes(StandardCharsets.US_ASCII);
+            Signature signer = Signature.getInstance("SHA256withECDSA");
+            signer.initSign(Keys.privateKey());
+            screen.status("Touch sensor", Color.rgb(180, 255, 200));
+            final long deadline = SystemClock.elapsedRealtime() + 25000;
+            handler.post(new Runnable() {
+                @Override public void run() {
+                    if (completed) return;
+                    screen.remaining((int) Math.max(0, (deadline - SystemClock.elapsedRealtime() + 999) / 1000));
+                    handler.postDelayed(this, 1000);
+                }
+            });
+            BiometricPrompt prompt = new BiometricPrompt.Builder(this)
+                    .setTitle(service.equals("pair") ? "Pair this phone with a PC?" : "Computer sign-in")
+                    .setSubtitle(user + " @ " + host)
+                    .setDescription("Service: " + service + ". Confirm with a strong biometric.")
+                    .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                    .setNegativeButton("Cancel / use PC password", getMainExecutor(),
+                            (dialog, which) -> fail("cancelled"))
+                    .build();
+            handler.postDelayed(() -> { fail("timeout"); cancellation.cancel(); }, 25000);
+            prompt.authenticate(new BiometricPrompt.CryptoObject(signer), cancellation,
+                    getMainExecutor(), new BiometricPrompt.AuthenticationCallback() {
+                        @Override public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+                            if (completed) return;
+                            try {
+                                Signature signature = result.getCryptoObject().getSignature();
+                                signature.update(payload);
+                                JSONObject response = new JSONObject();
+                                response.put("nonce", nonce);
+                                response.put("public_key", Base64.encodeToString(Keys.publicKey(), Base64.NO_WRAP));
+                                response.put("signature", Base64.encodeToString(signature.sign(), Base64.NO_WRAP));
+                                complete(response);
+                            } catch (Exception error) { fail(error.getClass().getSimpleName()); }
+                        }
+                        @Override public void onAuthenticationError(int code, CharSequence error) {
+                            fail("biometric_" + code + ": " + error);
+                        }
+                        @Override public void onAuthenticationFailed() {
+                            screen.status("Try again", Color.rgb(255, 210, 100));
+                        }
+                    });
+        } catch (Exception error) { fail(error.getClass().getSimpleName() + ": " + error.getMessage()); }
     }
 
-    @Override
-    public void onClick(View view) {
-        if (view.getId() == R.id.authButton) {
-            attemptDecrypt();
-        }
+    private void fail(String error) {
+        try {
+            JSONObject response = new JSONObject();
+            response.put("nonce", nonce);
+            response.put("error", error);
+            complete(response);
+        } catch (Exception ignored) { finish(); }
     }
 
-    private void returnToServer(){
-
-        synchronized (MyHTTPD.syncToken) {
-            MyHTTPD.syncToken.notify();
-        }
-        finish();
+    private void complete(JSONObject response) {
+        if (completed) return;
+        completed = true;
+        handler.removeCallbacksAndMessages(null);
+        Results.complete(nonce, response.toString());
+        screen.result(!response.has("error"));
+        // Publish the result immediately, but keep the small physical display
+        // confirmation visible briefly. No signature can be reused afterward.
+        handler.postDelayed(this::finish, 1400);
     }
 
-    private void failAuth(){
-        Toast.makeText(this, R.string.toastFailGetEncrypted,Toast.LENGTH_LONG).show();
-        returnToServer();
-    }
-
-    @Override
-    protected void onDestroy() {
+    @Override protected void onDestroy() {
+        if (nonce != null && !completed) fail("activity_closed");
+        cancellation.cancel();
+        handler.removeCallbacksAndMessages(null);
         super.onDestroy();
-        if(registered){
-            unregisterReceiver(screenCheck);
-            registered = false;
-        }
-
     }
 }

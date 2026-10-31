@@ -19,3 +19,23 @@
 /Android/.externalNativeBuild
 
 /Desktop/config
+/build/
+/Android/app/build/
+/Desktop/__pycache__/
+/tests/__pycache__/
+
+# Local enrollment, signing material, device captures and IDE state.
+*.p12
+*.jks
+*.keystore
+*.pem
+*.key
+pairing*.json
+pairing*.json.lock
+*.heic
+*.log
+.env
+.env.*
+/Android/.idea/
+__pycache__/
+.DS_Store
