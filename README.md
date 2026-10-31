@@ -1,7 +1,8 @@
 # PAM Android Fingerprint
 
 Use an Android phone's strong biometric sensor to authorize local Linux PAM
-authentication over an **existing, authorized ADB connection**.
+authentication over **mutually authenticated TLS on your LAN**, or an optional
+existing authorized ADB connection.
 
 A modernization of [jrandiny/pam-android-fingerprint](https://github.com/jrandiny/pam-android-fingerprint),
 under the original MIT license. The original Python 2, `pam_python`, HTTP and
@@ -11,9 +12,9 @@ provided. Password fallback must remain available.**
 
 ## Changes in this fork
 
-* Replaced Python 2, `pam_python`, HTTP and TOTP with Python 3 and signed
-  challenge–response over an existing authorized ADB connection. No phone
-  network listener or Internet permission.
+* Replaced Python 2, `pam_python`, plaintext HTTP and TOTP with Python 3 and
+  signed challenge–response. The opt-in LAN listener requires mutual TLS;
+  ADB remains an optional transport, not a runtime requirement for LAN.
 * Added pinned P-256 Android Keystore keys with hardware-enforced, per-use
   strong-biometric authorization. Signatures bind a fresh nonce, computer,
   Linux user and PAM service; there is no phone PIN fallback.
@@ -23,9 +24,14 @@ provided. Password fallback must remain available.**
 * Added configurable confirmation areas and forced orientation for damaged
   screens, plus public-key SHA256 Copy/Share with security confirmations,
   eight-character hyphenated groups and high-contrast symbol colors.
+  Confirmation windows use a separate task from settings and finish only their
+  own activity, without bringing the app's main window to the foreground.
 * Added KDE's dedicated fingerprint PAM example for automatic unlock,
   request-lifetime cancellation and renewable phone leases without an overall
   fingerprint deadline. Ordinary sudo/Polkit requests remain time-limited.
+* Added a socket-activated, unprivileged systemd TLS broker so KDE's user-mode
+  PAM worker does not need access to the root-owned desktop TLS private key.
+  PAM helpers still verify fresh phone signatures independently.
 * Added optional KDE Wayland monitor wake after unlock, a narrowly scoped
   socket-activated Polkit sandbox example, and best-effort SSH hints that let
   sudo skip phone waiting and continue to the normal password path.
@@ -38,7 +44,8 @@ provided. Password fallback must remain available.**
 * Android 11 / API 30 or newer, an enrolled strong biometric and a hardware-backed
   Android Keystore supporting biometric authorization for every signature.
   Runtime checks reject unsupported key policies.
-* Linux, Python 3 with `cryptography`, `/usr/bin/adb` and an already running,
+* Linux, Python 3 with `cryptography` 42+ and a reachable LAN endpoint.
+  For the optional ADB transport only: `/usr/bin/adb` and an already running,
   authorized ADB server at `127.0.0.1:5037`.
 * For building: JDK 17, Android SDK platform 36 and build-tools 36.0.0.
 
@@ -69,7 +76,161 @@ build path. A public release needs separately managed release signing.
 Open **PAM Fingerprint** and check biometric/key readiness. If the key policy
 check fails, stop rather than relaxing the hardware or authorization checks.
 
-## Pair a phone
+## Direct LAN setup (no ADB at runtime)
+
+The listener is **off by default**. Installation of the APK can use USB/ADB,
+but a configured LAN request does not need an ADB daemon or connection.
+Only literal IPv4 or bracketed IPv6 endpoints are accepted; use a DHCP
+reservation/stable address. Do not forward this listener through an Internet
+router. The listener accepts only private/site-local, IPv6 ULA or loopback
+client addresses, in addition to mandatory mTLS. Local-network reachability
+and device power management still matter.
+
+Three fingerprints have distinct roles:
+
+* **Desktop TLS certificate SHA256:** the phone pins this before accepting a
+  connection or opening an authentication prompt.
+* **Phone TLS certificate SHA256:** the PC pins this before sending a request.
+  Both TLS pins hash the complete DER leaf certificate, not its PEM text.
+* **Biometric key SHA256:** the existing hardware-backed, per-use signing key.
+  Channel authentication never replaces its fresh biometric signature.
+
+For an unprivileged development test, create a private desktop identity:
+
+```sh
+python3 -I Desktop/main.py network-identity --output build/desktop-tls.pem
+```
+
+Keep the PEM private and mode `0600`; **never send it to a phone or commit it**.
+Only transfer its printed public certificate fingerprint. For production PAM,
+create the identity directly in a root-owned, protected location such as
+`/etc/pam-android-fingerprint-client.pem` using the reviewed root-owned helper.
+Root-mode requests reject user-owned/readable identity files and untrusted or
+symlinked parent paths. TLS loads a sealed memory snapshot, not a reopened
+caller-controlled path.
+
+On the phone, open **Direct network settings**, enter the desktop certificate
+fingerprint, enable the listener, and allow authentication notifications.
+Read/copy the separate **Phone TLS certificate SHA256** and the displayed
+network endpoint. The app uses an ongoing `connectedDevice` foreground service.
+
+For an already enrolled phone, add the network transport without replacing its
+biometric pin:
+
+```sh
+python3 -I Desktop/main.py add-network --config build/pairing.json \
+  --phone primary --endpoint 192.0.2.20:48751 \
+  --tls-fingerprint PHONE_TLS_CERTIFICATE_SHA256 \
+  --identity build/desktop-tls.pem
+```
+
+This requires a new biometric signature from the original pinned phone before
+updating the registry. All network phones in one registry use one desktop
+identity. A network-enabled entry is LAN-only by default: optional ADB fallback
+must be explicitly enabled with `"adb_fallback": true`. Certificate-pin or
+protocol failures never retry a request through another transport.
+
+For a new phone, pairing can also be entirely over LAN:
+
+```sh
+python3 -I Desktop/main.py pair \
+  --network 192.0.2.20:48751 --identity build/desktop-tls.pem \
+  --tls-fingerprint PHONE_TLS_CERTIFICATE_SHA256 \
+  --label primary --user alice --host workstation --services sudo,sudo-i \
+  --expect-fingerprint PHONE_BIOMETRIC_KEY_SHA256 \
+  --output build/pairing.json
+```
+
+Use `--add` and the identical registry user/host/services for a second phone.
+No first-use network trust bypass or automatic certificate replacement exists.
+Replacing either certificate requires deliberate repinning; replacing a
+biometric key still requires explicit re-enrollment. Desktop certificates have
+a ten-year validity; the separate phone TLS certificate expires in 2100.
+Both sides enforce current certificate validity.
+The phone's **Reset phone TLS certificate** action disables the listener and
+replaces only the channel identity after confirmation. It does not delete or
+regenerate the biometric signing key. Re-enable the listener and explicitly
+repin the new TLS certificate on each PC afterward. The separate TLS key allows
+raw ECDSA transcript-hash signing as required by Android TLS; the biometric
+key's SHA-256-only, strong-biometric-per-use policy is unchanged.
+
+### Systemd broker for KDE and other PAM callers
+
+KDE's screen-lock fingerprint worker runs as the session user, unlike sudo and
+Polkit's privileged helpers. It cannot read a root-owned `0600` TLS identity.
+**Do not make that private key public or make the Python helper setuid.**
+Use the broker examples in `examples/systemd/` and `examples/sysusers.d/`:
+
+1. Install `Desktop/main.py` as the reviewed, root-owned
+   `/usr/local/libexec/pam-android-fingerprint` and `Desktop/broker.py` as
+   `/usr/local/libexec/pam-android-fingerprint-broker.py`.
+2. Create the dedicated system account using the sysusers example. Install the
+   broker service/socket units. In a socket drop-in set `SocketUser=alice`
+   (your enrolled Linux user); retain `SocketMode=0600`.
+3. Keep the desktop PEM **root-owned `0600`**. `LoadCredential=` provides a
+   read-only copy only to the dedicated service account; root/user PAM clients
+   never receive its contents. The service does not run as root.
+4. In a service drop-in use `IPAddressDeny=any` and an `IPAddressAllow=` entry
+   for each phone's literal IP (`/32` for IPv4, `/128` for IPv6).
+5. Add `"broker_socket": "/run/pam-android-fingerprint-broker.sock"` to the
+   root-owned pairing registry, retaining its existing pins, user, host,
+   services and `network_identity`. Validate units, reload systemd, then enable
+   `pam-android-fingerprint-broker.socket`. Restart the broker service after
+   changing the registry, phone endpoint/pins, or desktop credential.
+
+This remains a manual, distribution-specific installation, not an automatic PAM
+installer. Stage and test the socket and loaded credential before switching the
+active registry. Keep password fallback and a recovery path.
+
+The broker accepts only root and the registered user's kernel-reported
+`SO_PEERCRED` identity. Clients require a protected filesystem socket created
+by the system manager: an activated listener reports root's credentials, not
+the accepting service account's. The service resolves targets/context only from
+its protected registry, bounds concurrent requests, and relays signed responses.
+Each PAM helper generates its own nonce and verifies the original pinned
+biometric signature. A broker “success” flag is never authentication.
+
+Closing/cancelling the PAM request closes the Unix connection and cancels the
+phone request. A frozen/dead client also loses its renewable six-second broker
+lease. Only the dedicated KDE branch waits indefinitely while its owner remains
+alive. No `loginctl unlock-session`, D-Bus unlock shortcut, authentication cache,
+or alternate lock-screen mechanism is used.
+
+With the broker, Polkit needs only filesystem Unix-socket access; it does not
+need its network sandbox opened for TLS or ADB. Test this under the actual vendor
+unit before removing an existing network drop-in. ADB-only fallback phones still
+need the separately documented ADB path.
+
+### Background requests and reboot
+
+* On Android 11–14, the owner can optionally grant **display over other apps**
+  access for automatic prompt opening. The app does not draw a hidden overlay.
+  Without that grant, tap the authenticated request notification.
+* On Android 15+, background requests use notification-tap fallback; no
+  unsupported automatic-window or full-screen-intent guarantee is made.
+* App notifications and the authentication channel must be enabled.
+* Enable unrestricted battery/background use in Android app settings if needed.
+  OEM power management, Doze, force-stop and user-stopped services can prevent
+  availability; a foreground service is not an unconditional uptime guarantee.
+* An enabled listener is started by normal `BOOT_COMPLETED`, after the first
+  phone unlock. First unlock with the phone PIN/password and biometric lockout
+  rules remain mandatory. The service cannot bypass them.
+* The PC makes a new authenticated phone connection for each request. There is
+  no PC-side ADB reconnect step. The optional systemd broker is socket-activated;
+  without it, the helper connects directly using its own accessible identity.
+
+Disabling the listener or changing its desktop pin closes existing connections.
+Disconnect, cancellation, invalid frames and an expired eight-second heartbeat
+lease cancel the exact owned request. A stale notification cannot recreate it.
+Ordinary requests retain a bounded wait; only `kde-fingerprint` can wait
+indefinitely while its PAM owner and authenticated connection remain alive.
+
+Keep the registry, private client PEM and all their parent directories protected
+when installing for PAM. Back up the working configuration and test fresh-touch,
+bad pins, disconnect/cancel, phone/PC reboot and real password fallback before
+switching the active stack.
+
+## Pair a phone over optional ADB
 
 Read its **Key SHA256** directly from the physical phone screen, independently
 of ADB. The 64 hex characters are displayed in eight-character groups joined
@@ -168,7 +329,7 @@ restricted by the OS, multi-window mode or device policy.
 
 ## Security model
 
-* P-256 private keys remain in Android Keystore. The app checks hardware backing,
+* P-256 biometric private keys remain in Android Keystore. The app checks hardware backing,
   hardware-enforced authorization, biometric-only policy and enrollment
   invalidation. Every signature uses a new `Signature` CryptoObject requiring
   **fresh strong-biometric authorization**. No PIN/device-credential fallback.
@@ -177,12 +338,19 @@ restricted by the OS, multi-window mode or device policy.
   devices may offer a different strong biometric.
 * Signatures bind a random 256-bit nonce, host, Linux username and PAM service.
   Replays, changed context and responses from a different pinned key fail.
-* No HTTP/network listener, Internet permission, exported private key or biometric
-  data transfer. Results are temporary, in memory, readable only by Android's
-  shell UID. ADB output and individual control-command durations are bounded.
+* The optional LAN listener uses TLS 1.2+ with an explicitly pinned client
+  certificate before dispatching any request. The desktop pins the phone's
+  separate TLS certificate before sending a nonce/context. No plaintext HTTP,
+  exported phone private keys or biometric data transfer. The desktop TLS
+  private PEM is a distinct, owner-only secret, not a biometric credential.
+* Results are temporary and in memory. The optional ADB provider permits only
+  Android's shell UID; LAN results belong to the authenticated connection.
+  Bounded frames, absolute deadlines and bounded workers limit malformed input
+  and resource use, but cannot eliminate network denial of service.
+  ADB output and individual control-command durations are also bounded.
   Only the leased KDE fingerprint result wait has no overall deadline while its
   authentication owner and phone connection remain alive.
-* The helper uses a sanitized subprocess environment and the literal
+* For optional ADB, the helper uses a sanitized subprocess environment and the literal
   `-H 127.0.0.1 -P 5037`. Do not replace the numeric address with `localhost`:
   ADB treats that differently when considering daemon startup. Verify your ADB
   build does not auto-start a server at the chosen numeric endpoint.
@@ -211,6 +379,7 @@ privilege mechanism:
 | --- | --- | --- |
 | `/usr/local/libexec/pam-android-fingerprint` | `Desktop/main.py` | root:root 0644 |
 | `/etc/pam-android-fingerprint.json` | your pairing registry | root:root 0644 |
+| `/etc/pam-android-fingerprint-client.pem` (LAN only) | private desktop TLS identity | root:root 0600 |
 
 The helper is executed explicitly by isolated system Python. Never reference a
 user-writable script or checkout from PAM. The registry contains public keys,
@@ -314,6 +483,15 @@ a password. Do not restart an in-progress authorization or the desktop agent.
 Rollback is removal of this drop-in followed by `systemctl daemon-reload`;
 subsequent helper instances use the vendor sandbox again.
 
+For direct LAN, allow only the enrolled phones' exact literal IPs in the same
+service's `IPAddressAllow` list, retaining `IPAddressDeny=any` and the other
+restrictions. For example, a documentation-only phone at `192.0.2.20` would need
+`IPAddressAllow=192.0.2.20/32`. IPv6 also needs `AF_INET6` and exact IPv6 host
+allows. Recheck effective inherited policy and actual cgroup-BPF enforcement.
+The client PEM can be read from its protected `/etc` path; no home-directory
+exposure or writable state directory is required for direct TLS. The ADB-specific
+state/bind settings are needed only if ADB fallback is deliberately retained.
+
 ### KDE: unlock without pressing the Unlock button
 
 KScreenLocker has a separate, noninteractive fingerprint PAM authenticator.
@@ -348,7 +526,7 @@ profile installed as `/etc/pam.d/kde-fingerprint`:
 * The Android operation also requires a renewable eight-second connection lease,
   refreshed by the live helper every two seconds. This is **not** a fingerprint
   timeout: a healthy request can wait indefinitely. If the helper is forcibly
-  killed or ADB disappears, an abandoned phone prompt expires without granting
+  killed or its transport disappears, an abandoned phone prompt expires without granting
   authentication. Ordinary sudo/pairing requests keep their bounded wait.
 
 KScreenLocker uses this profile's **auth** stack; do not assume the included

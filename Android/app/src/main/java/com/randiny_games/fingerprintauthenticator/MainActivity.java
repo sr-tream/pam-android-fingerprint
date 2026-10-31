@@ -45,7 +45,7 @@ public final class MainActivity extends Activity {
         int status = getSystemService(BiometricManager.class).canAuthenticate(
                 BiometricManager.Authenticators.BIOMETRIC_STRONG);
         String description = "Android fingerprint → Linux\n\n" +
-                "Uses an already authorized ADB connection. " +
+                "Uses paired, encrypted LAN connections or optional authorized ADB. " +
                 "Every request needs fresh strong-biometric authorization. No PIN fallback.\n\n" +
                 "Biometrics: " + (status == 0 ? "ready" : "not ready (code " + status + ")") +
                 "\n\nRun pair on your computer to enroll this phone.";
@@ -107,6 +107,10 @@ public final class MainActivity extends Activity {
         share.setEnabled(pairing != null);
         share.setOnClickListener(v -> confirmTransfer(pairing, true));
         layout.addView(share);
+        Button network = new Button(this);
+        network.setText("Direct network settings (no ADB)");
+        network.setOnClickListener(v -> startActivity(new Intent(this, NetworkSettingsActivity.class)));
+        layout.addView(network);
         Button enroll = new Button(this);
         enroll.setText("Enroll fingerprints");
         enroll.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_BIOMETRIC_ENROLL)

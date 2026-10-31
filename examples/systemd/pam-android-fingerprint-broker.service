@@ -1,0 +1,35 @@
+[Unit]
+Description=Android fingerprint TLS transport broker
+Requires=pam-android-fingerprint-broker.socket
+After=network.target
+
+[Service]
+User=pam-android-fingerprint
+Group=pam-android-fingerprint
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/pam-android-fingerprint-broker.py --helper /usr/local/libexec/pam-android-fingerprint --identity %d/client.pem
+LoadCredential=client.pem:/etc/pam-android-fingerprint-client.pem
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+LimitNOFILE=64
+TasksMax=12
+MemoryMax=128M
+TimeoutStopSec=8
+# In a drop-in add IPAddressDeny=any and IPAddressAllow=PHONE_IP/32
+# (or /128 for IPv6), for every enrolled LAN phone.

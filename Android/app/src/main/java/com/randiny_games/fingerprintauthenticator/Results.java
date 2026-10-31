@@ -112,6 +112,20 @@ final class Results {
         return state.equals("pending") || state.equals("complete");
     }
 
+    static boolean touch(Pending owner, long now) {
+        Runnable expired;
+        synchronized (Results.class) {
+            if (owner == null || requests.get(owner.nonce) != owner || owner.cancelled) return false;
+            if (!owner.persistent || owner.future.isDone() || now < owner.leaseUntil) {
+                if (owner.persistent) owner.leaseUntil = now + LEASE_MILLIS;
+                return true;
+            }
+            expired = markCancelled(owner, "client_disconnected");
+        }
+        if (expired != null) expired.run();
+        return false;
+    }
+
     static boolean active(Pending pending, long now) {
         Runnable expire;
         synchronized (Results.class) {
@@ -134,6 +148,18 @@ final class Results {
             pending = requests.get(nonce);
             if (pending == null || pending.cancelled || pending.future.isDone()) return false;
             callback = markCancelled(pending, "client_cancelled");
+        }
+        if (callback != null) callback.run();
+        return true;
+    }
+
+    static boolean cancel(Pending owner) {
+        Runnable callback;
+        synchronized (Results.class) {
+            if (owner == null || requests.get(owner.nonce) != owner) return false;
+            rememberStopped(owner.nonce);
+            if (owner.cancelled || owner.future.isDone()) return false;
+            callback = markCancelled(owner, "client_cancelled");
         }
         if (callback != null) callback.run();
         return true;

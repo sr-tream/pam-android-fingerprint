@@ -25,6 +25,7 @@ public final class AuthActivity extends Activity {
     private byte[] payload;
     private BiometricPrompt prompt;
     private Results.Pending pending;
+    private RequestOwner owner;
     private AuthScreen screen;
 
     private static String field(String value) {
@@ -39,7 +40,7 @@ public final class AuthActivity extends Activity {
             // The destroyed instance has already failed or completed this
             // operation. Never resurrect its nonce after a configuration change.
             completed = true;
-            finish();
+            closeWindow();
             return;
         }
         setShowWhenLocked(true);
@@ -50,18 +51,26 @@ public final class AuthActivity extends Activity {
         nonce = getIntent().getStringExtra("nonce");
         if (nonce == null || !nonce.matches("[0-9a-f]{64}")) {
             completed = true;
-            finish();
+            closeWindow();
             return;
         }
         try {
-            String host = field(getIntent().getStringExtra("host"));
-            String user = field(getIntent().getStringExtra("user"));
-            String service = field(getIntent().getStringExtra("service"));
-            // Old desktop clients keep their bounded behavior during upgrades.
-            persistent = service.equals("kde-fingerprint") &&
-                    "leased-v1".equals(getIntent().getStringExtra("control"));
-            pending = Results.start(nonce, persistent,
-                    () -> runOnUiThread(this::clientClosed), SystemClock.elapsedRealtime());
+            String networkToken = getIntent().getStringExtra("network_owner");
+            if (networkToken != null) {
+                owner = RequestOwner.attach(nonce, networkToken,
+                        () -> runOnUiThread(this::clientClosed), SystemClock.elapsedRealtime());
+            } else {
+                String service = field(getIntent().getStringExtra("service"));
+                boolean unlimited = service.equals("kde-fingerprint") &&
+                        "leased-v1".equals(getIntent().getStringExtra("control"));
+                owner = RequestOwner.start(nonce, field(getIntent().getStringExtra("host")),
+                        field(getIntent().getStringExtra("user")), service, false, unlimited,
+                        SystemClock.elapsedRealtime());
+                owner.attachAdb(() -> runOnUiThread(this::clientClosed));
+            }
+            String host = owner.host, user = owner.user, service = owner.service;
+            persistent = owner.unlimited;
+            pending = owner.pending;
             screen.context(host, user, service);
             payload = ("pam-android-fingerprint:v2\n" + nonce + "\n" +
                     host + "\n" + user + "\n" + service + "\n").getBytes(StandardCharsets.US_ASCII);
@@ -73,8 +82,7 @@ public final class AuthActivity extends Activity {
                     .setNegativeButton("Cancel / use PC password", getMainExecutor(),
                             (dialog, which) -> fail("cancelled"))
                     .build();
-            if (persistent) {
-                screen.waitingForPc();
+            if (pending.persistent) {
                 handler.post(new Runnable() {
                     @Override public void run() {
                         if (completed) return;
@@ -85,6 +93,9 @@ public final class AuthActivity extends Activity {
                         handler.postDelayed(this, 500);
                     }
                 });
+            }
+            if (persistent) {
+                screen.waitingForPc();
             } else {
                 final long deadline = SystemClock.elapsedRealtime() + 25000;
                 handler.post(new Runnable() {
@@ -154,6 +165,13 @@ public final class AuthActivity extends Activity {
     private void clientClosed() {
         if (!completed) fail("request_closed");
         cancellation.cancel();
+        closeWindow();
+    }
+
+    private void closeWindow() {
+        // Separate affinity keeps MainActivity/settings out of this task.
+        // Finish ONLY this instance: a legacy ADB caller can put a newer
+        // request above this one during the short result-feedback interval.
         finish();
     }
 
@@ -163,7 +181,7 @@ public final class AuthActivity extends Activity {
             response.put("nonce", nonce);
             response.put("error", error);
             complete(response);
-        } catch (Exception ignored) { finish(); }
+        } catch (Exception ignored) { closeWindow(); }
     }
 
     private void complete(JSONObject response) {
@@ -172,14 +190,16 @@ public final class AuthActivity extends Activity {
         handler.removeCallbacksAndMessages(null);
         cancellation.cancel();
         boolean published = Results.complete(pending, response.toString());
+        if (owner != null && !owner.network) RequestOwner.release(owner);
         screen.result(published && !response.has("error"));
         // Publish the result immediately, but keep the small physical display
         // confirmation visible briefly. No signature can be reused afterward.
-        handler.postDelayed(this::finish, 1400);
+        handler.postDelayed(this::closeWindow, 1400);
     }
 
     @Override protected void onDestroy() {
         if (nonce != null && !completed) fail("activity_closed");
+        if (owner != null && !owner.network) RequestOwner.release(owner);
         cancellation.cancel();
         handler.removeCallbacksAndMessages(null);
         super.onDestroy();

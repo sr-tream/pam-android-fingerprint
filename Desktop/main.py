@@ -1,9 +1,12 @@
 #!/usr/bin/python3 -I
-"""Pinned Android Keystore challenge-response authentication, over existing ADB."""
+"""Pinned Android biometric signatures over mutually authenticated TLS or optional ADB."""
 import argparse
 import base64
 import fcntl
+import datetime
+import errno
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -15,14 +18,18 @@ import selectors
 import signal
 import socket
 import stat
+import struct
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
 
 from cryptography.exceptions import InvalidSignature
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 
 PACKAGE = "com.randiny_games.fingerprintauthenticator"
 CONFIG = "/etc/pam-android-fingerprint.json"
@@ -35,8 +42,358 @@ SSH_HINTS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
 MAX_CALLER_ENV = 65536
 
 
+class NetworkUnavailable(ConnectionError):
+    """Only a pre-TLS TCP connection failure permits trying another route."""
+
+
+def network_address(value):
+    """Literal IPs only: no unbounded DNS or shell endpoint interpretation."""
+    if not isinstance(value, str) or not 1 <= len(value) <= 128:
+        raise ValueError("Expected a literal IP:port network endpoint")
+    if value.startswith("["):
+        host, separator, port = value[1:].partition("]:")
+    else:
+        host, separator, port = value.partition(":")
+    address = ipaddress.ip_address(host)
+    if not separator or not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise ValueError("Invalid network port")
+    if address.is_unspecified or address.is_multicast or "%" in host:
+        raise ValueError("Invalid network address")
+    return str(address), int(port)
+
+
+def network_endpoint(value):
+    network_address(value)
+    return value
+
+
+def read_network_identity(path):
+    path = Path(path)
+    if os.geteuid() == 0:
+        if not path.is_absolute() or str(path) != os.path.normpath(str(path)):
+            raise PermissionError("Root TLS identity requires an absolute protected path")
+        for parent in path.parents:
+            info = parent.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022):
+                raise PermissionError("Untrusted TLS identity directory")
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as source:
+        info = os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+                stat.S_IMODE(info.st_mode) != 0o600):
+            raise PermissionError("TLS identity must be an owner-only 0600 regular file")
+        data = source.read(16385)
+    if len(data) > 16384:
+        raise ValueError("Oversized TLS identity")
+    return data
+
+
+def tls_context(identity):
+    # Load an immutable snapshot, never re-open a user-replaceable PEM path.
+    return tls_context_bytes(read_network_identity(identity))
+
+
+def tls_context_bytes(data):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.check_hostname = False
+    # Authentication is the exact out-of-band certificate pin below, not a CA.
+    context.verify_mode = ssl.CERT_NONE
+    descriptor = os.memfd_create("pam-network-identity", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    try:
+        os.write(descriptor, data)
+        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS,
+                    fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+        context.load_cert_chain(f"/proc/self/fd/{descriptor}")
+    finally:
+        os.close(descriptor)
+    return context
+
+
+def create_network_identity(path):
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "PAM desktop TLS client")])
+    certificate = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+                   .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                   .not_valid_before(now - datetime.timedelta(days=1))
+                   .not_valid_after(now + datetime.timedelta(days=3650))
+                   .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                   .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+                   .sign(key, hashes.SHA256()))
+    data = certificate.public_bytes(serialization.Encoding.PEM) + key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600), "wb") as out:
+        os.fchmod(out.fileno(), 0o600)
+        out.write(data)
+        out.flush()
+        os.fsync(out.fileno())
+    return certificate.fingerprint(hashes.SHA256()).hex()
+
+
+class NetworkConnection:
+    def __init__(self, sock):
+        self.sock = sock
+
+    @classmethod
+    def connect(cls, network, identity, lifetime=None, context=None):
+        host, port = network_address(network["endpoint"])
+        if lifetime is not None:
+            lifetime.check()
+        if context is None:
+            context = tls_context(identity)
+        raw = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+        raw.settimeout(2)
+        try:
+            raw.connect((host, port))
+        except OSError as error:
+            raw.close()
+            if isinstance(error, TimeoutError) or error.errno in (
+                    errno.ECONNREFUSED, errno.ETIMEDOUT, errno.EHOSTUNREACH,
+                    errno.ENETUNREACH, errno.ENETDOWN, errno.EHOSTDOWN):
+                raise NetworkUnavailable("Phone TCP endpoint is unreachable") from error
+            raise ValueError("Phone TCP connection failed locally; refusing fallback") from error
+        except BaseException:
+            raw.close()
+            raise
+        try:
+            sock = context.wrap_socket(raw, server_hostname=None)
+        except OSError as error:
+            raw.close()
+            raise ValueError("Phone TLS handshake failed; refusing transport fallback") from error
+        except BaseException:
+            raw.close()
+            raise
+        try:
+            received = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+            if not secrets.compare_digest(received, network["tls_sha256"]):
+                raise ValueError("Phone TLS certificate differs from its pinned certificate")
+            certificate = x509.load_der_x509_certificate(sock.getpeercert(binary_form=True))
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if not certificate.not_valid_before_utc <= now <= certificate.not_valid_after_utc:
+                raise ValueError("Phone TLS certificate is not currently valid")
+            if lifetime is not None:
+                lifetime.check()
+            return cls(sock)
+        except BaseException:
+            sock.close()
+            raise
+
+    def close(self):
+        self.sock.close()
+
+    def send(self, value):
+        data = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode("ascii") + b"\n"
+        if len(data) > 4096:
+            raise ValueError("Oversized network request")
+        self.sock.settimeout(1)
+        self.sock.sendall(data)
+
+    def response(self, host, user, service, lifetime, nonce=None):
+        nonce = secrets.token_hex(32) if nonce is None else nonce
+        if not isinstance(nonce, str) or not NONCE.fullmatch(nonce):
+            raise ValueError("Invalid request nonce")
+        deadline = None if service == "kde-fingerprint" else time.monotonic() + 30
+        buffer = bytearray()
+        received = 0
+        try:
+            if deadline is None and lifetime.watch_parent:
+                lifetime.require_pam_pipe()
+            lifetime.check()
+            self.send(dict(v=1, op="authenticate", nonce=nonce, host=field(host),
+                           user=field(user), service=field(service)))
+            next_tick = time.monotonic() + 2
+            frame_started = None
+            while True:
+                lifetime.check()
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    raise RequestCancelled("Phone authentication timed out")
+                if frame_started is not None and now - frame_started >= 4:
+                    raise ValueError("Trickled network response")
+                if now >= next_tick:
+                    self.send(dict(v=1, op="keepalive", nonce=nonce))
+                    next_tick = time.monotonic() + 2
+                self.sock.settimeout(0.2)
+                try:
+                    chunk = self.sock.recv(4096)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    raise RequestCancelled("Phone disconnected")
+                if frame_started is None:
+                    frame_started = time.monotonic()
+                received += len(chunk)
+                buffer.extend(chunk)
+                if received > 16384 or len(buffer) > 4096:
+                    raise ValueError("Oversized network response")
+                if b"\n" not in buffer:
+                    continue
+                line, _, trailing = buffer.partition(b"\n")
+                value = json.loads(line)
+                if (not isinstance(value, dict) or type(value.get("v")) is not int or value["v"] != 1 or
+                        value.get("nonce") != nonce or value.get("op") != "result" or trailing):
+                    raise ValueError("Invalid network result")
+                lifetime.check()
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise RequestCancelled("Phone authentication timed out")
+                if not isinstance(value.get("response"), dict):
+                    raise ValueError("Missing signed phone response")
+                return value["response"], nonce
+        finally:
+            # EOF is authoritative cancellation; no reconnect or transport fallback
+            # may resurrect this request after the PAM owner has gone.
+            self.close()
+
+
 class RequestCancelled(ValueError):
     pass
+
+
+def ipc_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("Duplicate IPC field")
+        value[key] = item
+    return value
+
+
+def ipc_send(peer, value):
+    raw = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode("ascii") + b"\n"
+    if len(raw) > 4096:
+        raise ValueError("Oversized broker frame")
+    peer.settimeout(1)
+    peer.sendall(raw)
+
+
+class IpcFrames:
+    """Bounded strict JSON frames; incomplete frames have an absolute deadline."""
+    def __init__(self, peer):
+        self.peer = peer
+        self.buffer = bytearray()
+        self.started = None
+
+    def poll(self):
+        if self.started is not None and time.monotonic() - self.started >= 4:
+            raise ValueError("Trickled broker frame")
+        if b"\n" not in self.buffer:
+            self.peer.settimeout(0.2)
+            try:
+                chunk = self.peer.recv(4096)
+            except socket.timeout:
+                return None
+            if not chunk:
+                raise RequestCancelled("Broker peer disconnected")
+            if self.started is None:
+                self.started = time.monotonic()
+            self.buffer.extend(chunk)
+        if b"\n" not in self.buffer:
+            if len(self.buffer) > 4096:
+                raise ValueError("Oversized broker frame")
+            return None
+        line, _, trailing = self.buffer.partition(b"\n")
+        if len(line) > 4095:
+            raise ValueError("Oversized broker frame")
+        self.buffer = bytearray(trailing)
+        self.started = time.monotonic() if trailing else None
+        value = json.loads(line.decode("utf-8"), object_pairs_hook=ipc_object)
+        if not isinstance(value, dict) or type(value.get("v")) is not int or value["v"] != 1:
+            raise ValueError("Invalid broker protocol")
+        return value
+
+    def read(self, deadline, lifetime=None):
+        while time.monotonic() < deadline:
+            if lifetime is not None:
+                lifetime.check()
+            value = self.poll()
+            if value is not None:
+                if time.monotonic() >= deadline:
+                    break
+                return value
+        raise RequestCancelled("Broker phase timed out")
+
+
+def broker_path(path, user_uid):
+    value = Path(path)
+    if not value.is_absolute() or str(value) != os.path.normpath(str(value)) or not str(value).startswith("/run/"):
+        raise PermissionError("Broker socket must use a protected absolute /run path")
+    for parent in value.parents:
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise PermissionError("Untrusted broker socket directory")
+    info = value.lstat()
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid not in (0, user_uid) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise PermissionError("Untrusted broker socket")
+
+
+def peer_uid(peer):
+    return struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+
+
+class BrokerConnection:
+    def __init__(self, peer, frames):
+        self.peer, self.frames = peer, frames
+
+    @classmethod
+    def connect(cls, config, device, lifetime=None):
+        if lifetime is not None:
+            lifetime.check()
+        broker_path(config["broker_socket"], pwd.getpwnam(config["user"]).pw_uid)
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            peer.settimeout(2)
+            peer.connect(config["broker_socket"])
+            # An activated listener reports its creator (systemd/root), not
+            # the unprivileged accepting service. Filesystem ownership differs.
+            if peer_uid(peer) != 0:
+                raise PermissionError("Broker listener was not created by the system manager")
+            ipc_send(peer, dict(v=1, op="connect", phone=device["label"]))
+            frames = IpcFrames(peer)
+            value = frames.read(time.monotonic() + 6, lifetime)
+            if set(value) != {"v", "op"}:
+                raise ValueError("Invalid broker connection reply")
+            if value["op"] == "unavailable":
+                raise NetworkUnavailable("Selected phone TCP endpoint is unreachable")
+            if value["op"] != "connected":
+                raise ValueError("Broker refused the connection; no fallback")
+            return cls(peer, frames)
+        except BaseException:
+            peer.close()
+            raise
+
+    def close(self):
+        self.peer.close()
+
+    def response(self, host, user, service, lifetime):
+        nonce = secrets.token_hex(32)  # Never accept a broker-selected challenge.
+        deadline = None if service == "kde-fingerprint" else time.monotonic() + 30
+        try:
+            if deadline is None and lifetime.watch_parent:
+                lifetime.require_pam_pipe()
+            lifetime.check()
+            ipc_send(self.peer, dict(v=1, op="authenticate", nonce=nonce,
+                                    host=field(host), user=field(user), service=field(service)))
+            heartbeat = time.monotonic() + 2
+            while True:
+                lifetime.check()
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    raise RequestCancelled("Phone authentication timed out")
+                if now >= heartbeat:
+                    ipc_send(self.peer, dict(v=1, op="keepalive", nonce=nonce))
+                    heartbeat = time.monotonic() + 2
+                value = self.frames.poll()
+                if value is None:
+                    continue
+                lifetime.check()
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise RequestCancelled("Phone authentication timed out")
+                if (set(value) != {"v", "op", "nonce", "response"} or value["op"] != "result"
+                        or value["nonce"] != nonce or not isinstance(value["response"], dict)):
+                    raise ValueError("Invalid broker result")
+                return value["response"], nonce
+        finally:
+            self.close()
 
 
 class RequestLifetime:
@@ -243,6 +600,11 @@ def validate_config(config):
         raise ValueError("Missing PAM service allowlist")
     for service in config["services"]:
         field(service)
+    if "broker_socket" in config:
+        path = config["broker_socket"]
+        if (not isinstance(path, str) or len(path) > 107 or "\0" in path or
+                not path.startswith("/run/") or os.path.normpath(path) != path):
+            raise ValueError("Invalid protected broker socket path")
     if len(set(config["services"])) != len(config["services"]):
         raise ValueError("Duplicate PAM service")
     if not isinstance(config["devices"], list) or not 1 <= len(config["devices"]) <= MAX_DEVICES:
@@ -268,6 +630,19 @@ def validate_config(config):
                 raise ValueError("Invalid ADB endpoint")
         if device.get("pairing", "verified-hash") not in ("verified-hash", "trusted-adb"):
             raise ValueError("Unknown pairing trust mode")
+        if "network" in device:
+            network = device["network"]
+            if not isinstance(network, dict):
+                raise ValueError("Invalid network configuration")
+            network_address(network["endpoint"])
+            if not isinstance(network.get("tls_sha256"), str) or not NONCE.fullmatch(network["tls_sha256"]):
+                raise ValueError("Missing pinned phone TLS certificate SHA256")
+            if type(device.get("adb_fallback", False)) is not bool:
+                raise ValueError("Invalid ADB fallback flag")
+            if (not isinstance(config.get("network_identity"), str) or
+                    not config["network_identity"] or len(config["network_identity"]) > 4096 or
+                    "\0" in config["network_identity"]):
+                raise ValueError("Missing desktop TLS client identity")
     return config
 
 
@@ -334,6 +709,8 @@ def request_response(device, transport, host, user, service, lifetime=None):
     if lifetime is None:
         with RequestLifetime() as owned:
             return request_response(device, transport, host, user, service, owned)
+    if isinstance(transport, (NetworkConnection, BrokerConnection)):
+        return transport.response(host, user, service, lifetime)
     field(service)
     persistent = service == "kde-fingerprint"
     if persistent and lifetime.watch_parent:
@@ -346,7 +723,9 @@ def request_response(device, transport, host, user, service, lifetime=None):
     finished = False
     try:
         extra = ("--es", "control", "leased-v1") if persistent else ()
-        adb(transport, "shell", "am", "start", "-W", "-n",
+        # NEW_TASK | MULTIPLE_TASK: never reuse the app's settings task or
+        # another request's short-lived confirmation task.
+        adb(transport, "shell", "am", "start", "-f", "0x18000000", "-W", "-n",
             PACKAGE + "/.AuthActivity", "--es", "nonce", nonce,
             "--es", "host", field(host), "--es", "user", field(user),
             "--es", "service", service, *extra, timeout=8, lifetime=lifetime)
@@ -381,16 +760,31 @@ def choose_device(config, label=None, lifetime=None):
         devices = [device for device in devices if device["label"] == label]
         if not devices:
             raise ValueError("Unknown phone label")
-    output = adb(None, "devices", timeout=2, lifetime=lifetime).decode()
-    connected = []
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[1] == "device" and DEVICE.fullmatch(parts[0]):
-            connected.append(parts[0])
-    if len(connected) > 8:
-        raise ValueError("Too many connected transports")
+    connected = None
     serials = {}
     for device in devices:
+        if "network" in device:
+            try:
+                if "broker_socket" in config:
+                    return device, BrokerConnection.connect(config, device, lifetime)
+                return device, NetworkConnection.connect(
+                    device["network"], config["network_identity"], lifetime)
+            except NetworkUnavailable:
+                if not device.get("adb_fallback", False):
+                    continue
+        if connected is None:
+            try:
+                output = adb(None, "devices", timeout=2, lifetime=lifetime).decode()
+            except OSError:
+                connected = []
+            else:
+                connected = []
+                for line in output.splitlines():
+                    parts = line.split()
+                    if len(parts) == 2 and parts[1] == "device" and DEVICE.fullmatch(parts[0]):
+                        connected.append(parts[0])
+                if len(connected) > 8:
+                    raise ValueError("Too many connected transports")
         # Hints improve speed; the serial and mandatory pinned key remain the
         # identity. Enumerating also supports a changed wireless IP or USB.
         candidates = sorted(connected, key=lambda endpoint: (
@@ -493,9 +887,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("authenticate")
+    identity = commands.add_parser("network-identity", help="Create a private desktop mTLS identity")
+    identity.add_argument("--output", required=True)
+    attach = commands.add_parser("add-network", help="Verify and attach LAN transport to an enrolled phone")
+    attach.add_argument("--config", required=True)
+    attach.add_argument("--phone", required=True)
+    attach.add_argument("--endpoint", required=True, type=network_endpoint)
+    attach.add_argument("--tls-fingerprint", required=True, type=normalize_fingerprint)
+    attach.add_argument("--identity", required=True)
     pair = commands.add_parser("pair")
-    pair.add_argument("--device", required=True)
-    pair.add_argument("--serial", required=True)
+    transport = pair.add_mutually_exclusive_group(required=True)
+    transport.add_argument("--device", help="Optional ADB transport")
+    transport.add_argument("--network", type=network_endpoint, help="Direct literal IP:port")
+    pair.add_argument("--serial", help="Required for ADB; network-only defaults to net-LABEL")
+    pair.add_argument("--identity", help="Private desktop TLS PEM for direct network pairing")
+    pair.add_argument("--tls-fingerprint", type=normalize_fingerprint, help="Phone TLS certificate SHA256")
     pair.add_argument("--label", required=True)
     pair.add_argument("--user", required=True)
     pair.add_argument("--host", required=True)
@@ -514,9 +920,43 @@ def main():
     args = parser.parse_args()
     if args.command == "authenticate":
         return authenticate()
+    if args.command == "network-identity":
+        print("Desktop TLS certificate SHA256:", create_network_identity(args.output))
+        print("Enter this PUBLIC certificate fingerprint in the phone's network settings.")
+        print("Keep the identity PEM PRIVATE; never copy it to the phone.")
+        return 0
+    if args.command == "add-network":
+        config = load_config(args.config)
+        previous = json.loads(json.dumps(config))
+        devices = [d for d in config["devices"] if d["label"] == args.phone]
+        if len(devices) != 1:
+            raise ValueError("Unknown phone label")
+        identity = str(Path(args.identity).absolute())
+        if "network_identity" in config and config["network_identity"] != identity:
+            raise ValueError("All network phones must use the same desktop identity")
+        config["network_identity"] = identity
+        device = devices[0]
+        device["network"] = dict(endpoint=args.endpoint, tls_sha256=args.tls_fingerprint)
+        validate_config(config)
+        print("Confirm a fresh biometric on the selected phone; open its notification if needed.", flush=True)
+        with RequestLifetime() as lifetime:
+            connection = NetworkConnection.connect(device["network"], config["network_identity"], lifetime)
+            response, nonce = request_response(device, connection, config["host"], config["user"],
+                                               config["services"][0], lifetime)
+            verify(response, nonce, config["host"], config["user"],
+                   config["services"][0], device["public_key"])
+        save_pairing(args.config, config, add=True, expected=previous)
+        print("Network transport verified; existing biometric key pin preserved.")
+        return 0
     if args.command == "pair":
         expected = None
         field(args.label)
+        if args.network:
+            if args.trust_adb or not args.identity or not args.tls_fingerprint:
+                raise ValueError("Network pairing requires TLS identity, phone TLS pin and biometric key SHA256")
+            args.serial = args.serial or "net-" + args.label
+        elif not args.serial:
+            raise ValueError("ADB pairing requires --serial")
         field(args.serial)
         field(args.user)
         field(args.host)
@@ -533,11 +973,18 @@ def main():
                 raise FileExistsError("Pairing exists; use --add to enroll a different phone")
             config = dict(version=3, user=args.user, host=args.host,
                           services=args.services.split(","), devices=[])
-        device = dict(label=args.label, serial=args.serial, endpoints=[args.device])
+        device = dict(label=args.label, serial=args.serial, endpoints=[args.device] if args.device else [])
+        if args.network:
+            identity_path = str(Path(args.identity).absolute())
+            if "network_identity" in config and config["network_identity"] != identity_path:
+                raise ValueError("All network phones must use the same desktop identity")
+            config["network_identity"] = identity_path
+            device["network"] = dict(endpoint=args.network, tls_sha256=args.tls_fingerprint)
         if args.trust_adb:
             print("WARNING: first-use pairing trusts the existing ADB channel, not remote attestation.", flush=True)
         print(f"Confirm pairing {args.label} with a fingerprint on the phone.", flush=True)
-        response, nonce = request_response(device, args.device, args.host, args.user, "pair")
+        selected = NetworkConnection.connect(device["network"], config["network_identity"]) if args.network else args.device
+        response, nonce = request_response(device, selected, args.host, args.user, "pair")
         if args.trust_adb:
             check_response(response, nonce)
             der, key = public_key(response["public_key"])

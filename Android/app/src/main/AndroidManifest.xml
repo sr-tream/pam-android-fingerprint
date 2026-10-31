@@ -2,6 +2,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="36" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Manifest prerequisite for an external-device network foreground service. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <application android:allowBackup="false" android:debuggable="false"
         android:label="PAM Fingerprint" android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:supportsRtl="true" android:usesCleartextTraffic="false">
@@ -12,10 +20,20 @@
             </intent-filter>
         </activity>
         <activity android:name=".DisplaySettingsActivity" android:exported="false" />
+        <activity android:name=".NetworkSettingsActivity" android:exported="false" />
+        <service android:name=".NetworkService" android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+        <receiver android:name=".NetworkBootReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
         <activity android:name=".DisplayPreviewActivity" android:exported="false"
             android:configChanges="orientation|screenSize"
             android:excludeFromRecents="true" />
         <activity android:name=".AuthActivity" android:exported="true"
+            android:taskAffinity="com.randiny_games.fingerprintauthenticator.authentication"
+            android:allowTaskReparenting="false"
             android:configChanges="orientation|screenSize"
             android:excludeFromRecents="true" />
         <provider android:name=".ResultProvider"

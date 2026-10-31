@@ -1,0 +1,13 @@
+[Unit]
+Description=Android fingerprint transport socket
+
+[Socket]
+ListenStream=/run/pam-android-fingerprint-broker.sock
+SocketMode=0600
+# Set SocketUser=YOUR_PAIRED_LINUX_USER in a drop-in before enabling.
+SocketUser=root
+Backlog=8
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
