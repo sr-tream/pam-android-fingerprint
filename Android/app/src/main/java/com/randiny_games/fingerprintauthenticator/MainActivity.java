@@ -121,6 +121,10 @@ public final class MainActivity extends Activity {
         display.setText("Confirmation display settings");
         display.setOnClickListener(v -> startActivity(new Intent(this, DisplaySettingsActivity.class)));
         layout.addView(display);
+        Button feedback = new Button(this);
+        feedback.setText("Success feedback");
+        feedback.setOnClickListener(v -> startActivity(new Intent(this, FeedbackSettingsActivity.class)));
+        layout.addView(feedback);
         ScrollView scroll = new ScrollView(this);
         scroll.addView(layout);
         setContentView(scroll);

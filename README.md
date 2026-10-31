@@ -26,6 +26,14 @@ provided. Password fallback must remain available.**
   eight-character hyphenated groups and high-contrast symbol colors.
   Confirmation windows use a separate task from settings and finish only their
   own activity, without bringing the app's main window to the foreground.
+* Added optional local signing feedback: a short app-only vibration (on by
+  default) and a quiet, smoothly enveloped 36 ms tone (off by default).
+  Configure them under **Success feedback**. Vibration is independent of global
+  touch feedback, without changing that setting; Silent, Do Not Disturb and
+  notification-vibration intensity still apply. Amplitude-capable hardware gets
+  a 32 ms pulse; other devices use a predefined tick. Sound is also skipped in
+  Vibrate mode. Feedback follows accepted signature publication on the phone,
+  not an acknowledgement that the PC has unlocked.
 * Added KDE's dedicated fingerprint PAM example for automatic unlock,
   request-lifetime cancellation and renewable phone leases without an overall
   fingerprint deadline. Ordinary sudo/Polkit requests remain time-limited.

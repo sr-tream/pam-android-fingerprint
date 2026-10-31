@@ -27,6 +27,7 @@ public final class AuthActivity extends Activity {
     private Results.Pending pending;
     private RequestOwner owner;
     private AuthScreen screen;
+    private SuccessFeedback feedback;
 
     private static String field(String value) {
         if (value == null || !value.matches("[A-Za-z0-9_.@-]{1,64}"))
@@ -48,6 +49,7 @@ public final class AuthActivity extends Activity {
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON |
                              android.view.WindowManager.LayoutParams.FLAG_SECURE);
         screen = new AuthScreen(this);
+        feedback = new SuccessFeedback(this);
         nonce = getIntent().getStringExtra("nonce");
         if (nonce == null || !nonce.matches("[0-9a-f]{64}")) {
             completed = true;
@@ -192,6 +194,7 @@ public final class AuthActivity extends Activity {
         boolean published = Results.complete(pending, response.toString());
         if (owner != null && !owner.network) RequestOwner.release(owner);
         screen.result(published && !response.has("error"));
+        if (published && !response.has("error")) feedback.play();
         // Publish the result immediately, but keep the small physical display
         // confirmation visible briefly. No signature can be reused afterward.
         handler.postDelayed(this::closeWindow, 1400);
@@ -201,6 +204,7 @@ public final class AuthActivity extends Activity {
         if (nonce != null && !completed) fail("activity_closed");
         if (owner != null && !owner.network) RequestOwner.release(owner);
         cancellation.cancel();
+        if (feedback != null) feedback.close();
         handler.removeCallbacksAndMessages(null);
         super.onDestroy();
     }
