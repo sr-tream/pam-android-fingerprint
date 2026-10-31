@@ -6,8 +6,10 @@ After=network.target
 [Service]
 User=pam-android-fingerprint
 Group=pam-android-fingerprint
-ExecStart=/usr/bin/python3 -I /usr/local/libexec/pam-android-fingerprint-broker.py --helper /usr/local/libexec/pam-android-fingerprint --identity %d/client.pem
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/pam-android-fingerprint-broker.py --helper /usr/local/libexec/pam-android-fingerprint --identity %d/client.pem --adb-home /var/lib/pam-android-fingerprint-broker
 LoadCredential=client.pem:/etc/pam-android-fingerprint-client.pem
+StateDirectory=pam-android-fingerprint-broker
+StateDirectoryMode=0700
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 ProtectSystem=strict
@@ -28,8 +30,9 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 UMask=0077
 LimitNOFILE=64
-TasksMax=12
+TasksMax=48
 MemoryMax=128M
 TimeoutStopSec=8
 # In a drop-in add IPAddressDeny=any and IPAddressAllow=PHONE_IP/32
 # (or /128 for IPv6), for every enrolled LAN phone.
+# For ADB transports also allow 127.0.0.1/32 to the existing ADB server.

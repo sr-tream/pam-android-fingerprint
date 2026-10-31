@@ -91,8 +91,48 @@ class ClientLease:
             self.renewed = time.monotonic()
 
 
+class SelectionLifetime:
+    """Bound setup and observe IPC death without installing worker-thread signals."""
+    watch_parent = False
+    def __init__(self, helper, peer, stopped):
+        self.helper, self.peer, self.stopped = helper, peer, stopped
+        self.deadline = time.monotonic() + 8
+
+    def check(self):
+        if self.stopped.is_set() or time.monotonic() >= self.deadline:
+            raise self.helper.RequestCancelled("Broker connection setup ended")
+        if select.select([self.peer], [], [], 0)[0] and not self.peer.recv(1, socket.MSG_PEEK):
+            raise self.helper.RequestCancelled("Broker client disconnected")
+
+
+class AdbConnection:
+    def __init__(self, helper, device, target):
+        self.helper, self.device, self.target = helper, device, target
+    def response(self, host, user, service, lifetime, nonce):
+        return self.helper.request_response(self.device, self.target, host, user, service,
+                                            lifetime, nonce=nonce)
+    def close(self):
+        pass  # request_response owns ADB processes and nonce-bound cancellation.
+
+
+def validate_adb_home(path):
+    if not path:
+        raise PermissionError("ADB transport needs a dedicated client HOME")
+    value = Path(path)
+    if not value.is_absolute() or str(value) != os.path.normpath(str(value)):
+        raise PermissionError("Invalid ADB client HOME")
+    for directory in (value, *value.parents):
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
+            raise PermissionError("Untrusted ADB client HOME")
+    info = value.lstat()
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise PermissionError("ADB client HOME must be service-owned 0700")
+    return str(value)
+
+
 class Broker:
-    def __init__(self, helper, config, context):
+    def __init__(self, helper, config, context, adb_home=None):
         self.helper, self.config, self.context = helper, config, context
         self.user_uid = pwd.getpwnam(config["user"]).pw_uid
         self.slots = threading.BoundedSemaphore(4)
@@ -101,6 +141,20 @@ class Broker:
         self.peers = set()
         self.threads = set()
         self.listener = None
+        self.adb_home = adb_home
+
+    def connect_phone(self, device, lifetime):
+        if "network" in device:
+            try:
+                return self.helper.NetworkConnection.connect(
+                    device["network"], None, lifetime, context=self.context)
+            except self.helper.NetworkUnavailable:
+                if not device.get("adb_fallback", False):
+                    raise
+        if self.adb_home is None:
+            raise PermissionError("ADB client HOME is not configured")
+        target = self.helper.select_adb(device, lifetime, home=self.adb_home)
+        return AdbConnection(self.helper, device, target)
 
     def serve(self, peer):
         phone = None
@@ -109,20 +163,19 @@ class Broker:
             first = frames.read(time.monotonic() + 5)
             if set(first) != {"v", "op", "phone"} or first["op"] != "connect":
                 raise ValueError("Expected connection selection")
-            devices = [d for d in self.config["devices"]
-                       if d["label"] == first["phone"] and "network" in d]
+            devices = [d for d in self.config["devices"] if d["label"] == first["phone"]]
             if len(devices) != 1:
                 raise ValueError("Unregistered network phone")
             try:
-                phone = self.helper.NetworkConnection.connect(
-                    devices[0]["network"], None, context=self.context)
+                phone = self.connect_phone(devices[0], SelectionLifetime(self.helper, peer, self.stopped))
             except self.helper.NetworkUnavailable:
                 self.helper.ipc_send(peer, dict(v=1, op="unavailable"))
                 return
             with self.lock:
                 if self.stopped.is_set():
                     return
-                self.peers.add(phone.sock)
+                if hasattr(phone, "sock"):
+                    self.peers.add(phone.sock)
             self.helper.ipc_send(peer, dict(v=1, op="connected"))
             request = frames.read(time.monotonic() + 5)
             if (set(request) != {"v", "op", "nonce", "host", "user", "service"}
@@ -148,7 +201,8 @@ class Broker:
         finally:
             if phone is not None:
                 with self.lock:
-                    self.peers.discard(phone.sock)
+                    if hasattr(phone, "sock"):
+                        self.peers.discard(phone.sock)
                 phone.close()
             with self.lock:
                 self.peers.discard(peer)
@@ -224,13 +278,17 @@ def main():
     parser.add_argument("--helper", default=str(Path(__file__).with_name("main.py")))
     parser.add_argument("--config", default="/etc/pam-android-fingerprint.json")
     parser.add_argument("--identity", required=True, help="systemd %%d/client.pem credential")
+    parser.add_argument("--adb-home", help="Dedicated writable systemd StateDirectory for ADB clients")
     args = parser.parse_args()
     if os.geteuid() == 0:
         raise PermissionError("The broker must run as its dedicated unprivileged service user")
     helper = types.SimpleNamespace(**runpy.run_path(args.helper, run_name="broker_helper"))
     config = helper.load_config(args.config, trusted=True)
     context = helper.tls_context_bytes(credential(args.identity))
-    broker = Broker(helper, config, context)
+    adb_home = validate_adb_home(args.adb_home) if args.adb_home is not None else None
+    if adb_home is None and any("network" not in d or d.get("adb_fallback", False) for d in config["devices"]):
+        raise PermissionError("Configured ADB transports need --adb-home")
+    broker = Broker(helper, config, context, adb_home)
     for signum in (signal.SIGTERM, signal.SIGINT):
         # Never acquire worker locks from a signal handler.
         signal.signal(signum, lambda *_: broker.stopped.set())

@@ -12,7 +12,7 @@ SOURCE = ROOT / "Android/app/src/main/java/com/randiny_games/fingerprintauthenti
 
 class FeedbackIntegrationTests(unittest.TestCase):
     def test_feedback_follows_only_accepted_successful_publication(self):
-        source = (SOURCE / "AuthActivity.java").read_text()
+        source = (SOURCE / "ConfirmationActivity.java").read_text()
         self.assertEqual(source.count("feedback.play()"), 1)
         complete = source[source.index("private void complete("):source.index("@Override protected void onDestroy")]
         self.assertLess(complete.index("if (completed) return;"), complete.index("Results.complete"))

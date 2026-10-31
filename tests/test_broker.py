@@ -96,8 +96,8 @@ class BrokerTests(unittest.TestCase):
             endpoint=f"127.0.0.1:{listener.getsockname()[1]}", tls_sha256=cert.fingerprint(hashes.SHA256()).hex())
         return done
 
-    def broker(self):
-        instance = service.Broker(app, self.config, app.tls_context(self.identity))
+    def broker(self, adb_home=None):
+        instance = service.Broker(app, self.config, app.tls_context(self.identity), adb_home)
         client, peer = socket.socketpair()
         instance.slots.acquire()
         instance.peers.add(peer)
@@ -257,11 +257,23 @@ class BrokerTests(unittest.TestCase):
             frames.poll()
 
     def test_local_policy_errors_never_select_a_fallback(self):
-        for code in (errno.EACCES, errno.EPERM, errno.EMFILE, errno.EADDRNOTAVAIL):
+        for code in (errno.EACCES, errno.EPERM, errno.EMFILE, errno.EADDRNOTAVAIL,
+                     errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN, errno.EHOSTDOWN):
             with patch.object(app.socket, "socket") as raw, self.assertRaises(ValueError) as error:
                 raw.return_value.connect.side_effect = OSError(code, "local policy")
                 app.NetworkConnection.connect(self.config["devices"][0]["network"], None, context=MagicMock())
             self.assertNotIsInstance(error.exception, app.NetworkUnavailable)
+
+    def test_routing_errors_do_not_trigger_broker_adb_fallback(self):
+        device = self.config["devices"][0]
+        device["adb_fallback"] = True
+        broker = service.Broker(app, self.config, app.tls_context(self.identity), "/test-home")
+        for code in (errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN, errno.EHOSTDOWN):
+            with self.subTest(code=code), patch.object(app.socket, "socket") as raw, \
+                    patch.object(app, "select_adb") as select_adb, self.assertRaises(ValueError):
+                raw.return_value.connect.side_effect = OSError(code, "routing failure")
+                broker.connect_phone(device, MagicMock())
+            select_adb.assert_not_called()
 
     def test_broker_failures_are_not_phone_unavailability(self):
         config = copy.deepcopy(self.config)
@@ -269,6 +281,99 @@ class BrokerTests(unittest.TestCase):
                 patch.object(app, "adb") as adb, self.assertRaises(ValueError):
             app.choose_device(config)
         adb.assert_not_called()
+
+    def test_adb_fallback_returns_signature_for_the_client_owned_nonce(self):
+        self.config["devices"][0]["adb_fallback"] = True
+        target = app.AdbTarget("TEST-USB", "/test-broker-home")
+        observed = {}
+        def adb(device, *args, **kwargs):
+            self.assertIs(device, target)
+            if args[:3] == ("shell", "getprop", "ro.serialno"):
+                return b"TEST"
+            if args[:3] == ("shell", "am", "start"):
+                observed["nonce"] = args[args.index("nonce")+1]
+                self.assertIn(".AuthActivity", " ".join(args))
+                return b"started"
+            if args[:3] == ("exec-out", "content", "read"):
+                nonce = observed["nonce"]
+                return json.dumps(dict(nonce=nonce, public_key=self.public, signature=base64.b64encode(
+                    self.bio.sign(app.message(nonce, "pc", self.config["user"], "sudo"),
+                                  ec.ECDSA(hashes.SHA256()))).decode())).encode()
+            raise AssertionError(args)
+        with patch.object(app.NetworkConnection, "connect", side_effect=app.NetworkUnavailable("offline")), \
+                patch.object(app, "select_adb", return_value=target) as select_adb, \
+                patch.object(app, "adb", side_effect=adb):
+            instance, client, frames, thread = self.broker("/test-broker-home")
+            with app.RequestLifetime() as lifetime:
+                response, nonce = app.BrokerConnection(client, frames).response(
+                    "pc", self.config["user"], "sudo", lifetime)
+            app.verify(response, nonce, "pc", self.config["user"], "sudo", self.public)
+            self.assertEqual(nonce, observed["nonce"])
+            select_adb.assert_called_once()
+            self.assertEqual(select_adb.call_args.kwargs["home"], "/test-broker-home")
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(instance.slots._value, 4)
+
+    def test_fallback_policy_never_downgrades_tls_or_local_failures(self):
+        device = self.config["devices"][0]
+        broker = service.Broker(app, self.config, app.tls_context(self.identity), "/test-home")
+        for failure in (ValueError("bad TLS pin"), ValueError("TLS timeout"), PermissionError("local policy")):
+            device["adb_fallback"] = True
+            with patch.object(app.NetworkConnection, "connect", side_effect=failure), \
+                    patch.object(app, "select_adb") as select_adb, self.assertRaises(type(failure)):
+                broker.connect_phone(device, MagicMock())
+            select_adb.assert_not_called()
+        device["adb_fallback"] = False
+        with patch.object(app.NetworkConnection, "connect", side_effect=app.NetworkUnavailable("offline")), \
+                patch.object(app, "select_adb") as select_adb, self.assertRaises(app.NetworkUnavailable):
+            broker.connect_phone(device, MagicMock())
+        select_adb.assert_not_called()
+
+    def test_broker_unavailability_does_not_escape_to_client_side_adb(self):
+        self.config["devices"][0]["adb_fallback"] = True
+        with patch.object(app.BrokerConnection, "connect", side_effect=app.NetworkUnavailable("offline")), \
+                patch.object(app, "adb") as adb, self.assertRaises(ValueError):
+            app.choose_device(self.config)
+        adb.assert_not_called()
+
+    def test_adb_only_device_uses_broker_and_is_preflighted_by_serial(self):
+        device = self.config["devices"][0]
+        del device["network"]
+        target = app.AdbTarget("TEST-USB", "/test-home")
+        broker = service.Broker(app, self.config, app.tls_context(self.identity), "/test-home")
+        with patch.object(app, "select_adb", return_value=target) as select_adb:
+            selected = broker.connect_phone(device, MagicMock())
+        self.assertIsInstance(selected, service.AdbConnection)
+        self.assertIs(selected.target, target)
+        select_adb.assert_called_once()
+        with patch.object(app, "adb") as adb:
+            adb.side_effect = [b"List of devices attached\nOTHER device\nTEST-USB device\n",
+                               b"WRONG", b"TEST"]
+            result = app.select_adb(device, home="/test-home")
+        self.assertEqual(result.endpoint, "TEST-USB")
+        self.assertEqual(result.home, "/test-home")
+
+    def test_adb_preflight_does_not_prompt_and_missing_server_is_unavailable(self):
+        device = self.config["devices"][0]
+        with patch.object(app, "adb", side_effect=ConnectionRefusedError()), self.assertRaises(app.NetworkUnavailable):
+            app.select_adb(device, home="/test-home")
+        with patch.object(app, "adb", side_effect=PermissionError()), self.assertRaises(PermissionError):
+            app.select_adb(device, home="/test-home")
+
+    def test_adb_home_is_owner_only_and_not_a_symlink(self):
+        with tempfile.TemporaryDirectory(prefix=".pam-adb-home-test-", dir=Path.home()) as temporary:
+            home = Path(temporary)
+            home.chmod(0o700)
+            self.assertEqual(service.validate_adb_home(home), str(home))
+            home.chmod(0o750)
+            with self.assertRaises(PermissionError):
+                service.validate_adb_home(home)
+            home.chmod(0o700)
+            alias = home / "alias"
+            alias.symlink_to(home, target_is_directory=True)
+            with self.assertRaises(PermissionError):
+                service.validate_adb_home(alias)
 
     def test_listener_creator_uid_is_checked_not_acceptor_uid(self):
         with patch.object(app, "broker_path"), patch.object(app, "peer_uid", return_value=os.getuid() or 1234), \

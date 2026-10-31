@@ -8,7 +8,6 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -39,7 +38,6 @@ public final class NetworkService extends Service {
     private final ScheduledExecutorService deadlines = Executors.newSingleThreadScheduledExecutor();
     private final ThreadPoolExecutor workers = new ThreadPoolExecutor(2, 2, 0, TimeUnit.SECONDS,
             new ArrayBlockingQueue<>(2), new ThreadPoolExecutor.AbortPolicy());
-    private String notificationToken;
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
@@ -187,56 +185,28 @@ public final class NetworkService extends Service {
             // Never log peer-supplied data, signatures or private identity material.
         } finally {
             lifecycle.finished(owner, peer);
-            if (owner != null) {
-                String token = owner.token;
-                handler.post(() -> getSystemService(NotificationManager.class).cancel(token, REQUEST_NOTIFICATION));
-            }
         }
     }
 
     private void launch(RequestOwner owner) {
         if (!Results.active(owner.pending, SystemClock.elapsedRealtime())) return;
-        NotificationManager notifications = getSystemService(NotificationManager.class);
-        if (!notifications.areNotificationsEnabled() ||
-                notifications.getNotificationChannel(REQUEST_CHANNEL).getImportance() == NotificationManager.IMPORTANCE_NONE) {
-            Results.cancel(owner.pending);
-            return;
-        }
-        Intent intent = new Intent(this, AuthActivity.class)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
-                .setData(Uri.parse("pam-network:" + owner.token))
-                .putExtra("nonce", owner.nonce).putExtra("network_owner", owner.token);
-        PendingIntent open = PendingIntent.getActivity(this, 0, intent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        Notification notification = new Notification.Builder(this, REQUEST_CHANNEL)
-                .setSmallIcon(android.R.drawable.ic_lock_lock)
-                .setContentTitle("Computer sign-in")
-                .setContentText("Tap to authorize " + owner.user + " @ " + owner.host)
-                .setVisibility(Notification.VISIBILITY_PRIVATE)
-                .setContentIntent(open).setAutoCancel(true).build();
-        notificationToken = owner.token;
-        try { notifications.notify(owner.token, REQUEST_NOTIFICATION, notification); }
-        catch (RuntimeException denied) { Results.cancel(owner.pending); return; }
         ActivityManager.RunningAppProcessInfo process = new ActivityManager.RunningAppProcessInfo();
         ActivityManager.getMyMemoryState(process);
         // Permission is an explicit opt-in on the tested Android 11/14 devices.
         // Android 15+ requires a visible overlay: use the notification instead,
         // never create a hidden overlay to evade background-start restrictions.
-        if (process.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND ||
-                Build.VERSION.SDK_INT < 35 && Settings.canDrawOverlays(this)) {
-            try { startActivity(intent); }
-            catch (RuntimeException unavailable) { /* The user can tap the notification. */ }
-        }
+        boolean automatic = process.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND ||
+                Build.VERSION.SDK_INT < 35 && Settings.canDrawOverlays(this);
+        RequestUi.open(this, owner, automatic);
     }
 
     private static void close(SSLSocket peer) { try { peer.close(); } catch (Exception ignored) {} }
 
     private void stopConnections() {
         lifecycle.revoke();
-        String token = notificationToken;
-        notificationToken = null;
-        if (token != null) getSystemService(NotificationManager.class).cancel(token, REQUEST_NOTIFICATION);
     }
+
+    @Override public void onTaskRemoved(Intent rootIntent) { RequestUi.taskRemoved(rootIntent); }
 
     @Override public void onDestroy() {
         stopConnections();

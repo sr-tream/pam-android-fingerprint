@@ -24,8 +24,9 @@ provided. Password fallback must remain available.**
 * Added configurable confirmation areas and forced orientation for damaged
   screens, plus public-key SHA256 Copy/Share with security confirmations,
   eight-character hyphenated groups and high-contrast symbol colors.
-  Confirmation windows use a separate task from settings and finish only their
-  own activity, without bringing the app's main window to the foreground.
+  Confirmation windows use owner-specific private tasks, separate from settings.
+  Unlimited KDE requests can pause and resume from Recents or their notification;
+  timed requests cancel when backgrounded. Completion removes only its own task.
 * Added optional local signing feedback: a short app-only vibration (on by
   default) and a quiet, smoothly enveloped 36 ms tone (off by default).
   Configure them under **Success feedback**. Vibration is independent of global
@@ -137,6 +138,11 @@ updating the registry. All network phones in one registry use one desktop
 identity. A network-enabled entry is LAN-only by default: optional ADB fallback
 must be explicitly enabled with `"adb_fallback": true`. Certificate-pin or
 protocol failures never retry a request through another transport.
+Fallback is limited to a refused TCP connection or its two-second connect
+timeout, before TLS starts. Routing/policy errors, TLS handshake timeouts and
+loss of an established connection do not switch transports. ADB must already
+be running and connected to a registered phone; the helper never runs
+`adb connect` or starts a server for fallback.
 
 For a new phone, pairing can also be entirely over LAN:
 
@@ -180,6 +186,10 @@ Use the broker examples in `examples/systemd/` and `examples/sysusers.d/`:
    never receive its contents. The service does not run as root.
 4. In a service drop-in use `IPAddressDeny=any` and an `IPAddressAllow=` entry
    for each phone's literal IP (`/32` for IPv4, `/128` for IPv6).
+   For optional ADB fallback/ADB-only phones, also allow `127.0.0.1/32`.
+   The example's private `StateDirectory=` supplies ADB's writable `HOME`;
+   it contains no copied desktop/phone private keys. Keep its mode `0700`,
+   owner the broker account, and the `--adb-home` path consistent.
 5. Add `"broker_socket": "/run/pam-android-fingerprint-broker.sock"` to the
    root-owned pairing registry, retaining its existing pins, user, host,
    services and `network_identity`. Validate units, reload systemd, then enable
@@ -206,8 +216,10 @@ or alternate lock-screen mechanism is used.
 
 With the broker, Polkit needs only filesystem Unix-socket access; it does not
 need its network sandbox opened for TLS or ADB. Test this under the actual vendor
-unit before removing an existing network drop-in. ADB-only fallback phones still
-need the separately documented ADB path.
+unit before removing an existing network drop-in. When a broker is configured,
+it handles ADB-only phones and explicitly enabled ADB fallback itself; PAM
+clients never escape to a local ADB connection. The broker's loopback rule does
+not require weakening Polkit's private network or address-family restrictions.
 
 ### Background requests and reboot
 
@@ -232,6 +244,26 @@ Disconnect, cancellation, invalid frames and an expired eight-second heartbeat
 lease cancel the exact owned request. A stale notification cannot recreate it.
 Ordinary requests retain a bounded wait; only `kde-fingerprint` can wait
 indefinitely while its PAM owner and authenticated connection remain alive.
+
+### Leaving the confirmation window
+
+* **sudo/Polkit and other timed requests:** switching apps or pressing Home
+  cancels the attempt. These windows stay out of Recents; the normal PC password
+  path remains available. Expiry closes the request, without automatic retries.
+* **Unlimited KDE requests:** switching apps pauses fingerprint scanning, not
+  the live PC request. Return through its Recents card or tap **Resume PC
+  unlock** in the notification. Resuming starts a fresh biometric operation;
+  the app does not force its window back to the foreground.
+* Cancel, Back in the app, or swiping its Recents card ends that attempt.
+  Successful phone signing or PC-side cancellation/password unlock removes the
+  request's notification and its own Recents card, without closing settings or
+  other applications. If task ownership cannot be verified, only notification
+  resume is used; losing that sole resume surface cancels the request.
+
+Resume requires the original live in-memory request and a renewed PC lease.
+Android killing the app cancels it; an old notification/card cannot restart
+authentication. Cleanup cannot run while the app process is dead; reopening a
+stale private confirmation closes it rather than reviving a request.
 
 Keep the registry, private client PEM and all their parent directories protected
 when installing for PAM. Back up the working configuration and test fresh-touch,

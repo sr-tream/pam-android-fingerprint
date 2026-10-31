@@ -51,6 +51,14 @@ final class RequestOwner {
         return owner;
     }
 
+    static synchronized RequestOwner lookup(String nonce, String token, long now) {
+        RequestOwner owner = active;
+        if (owner == null || !owner.nonce.equals(nonce) || !owner.token.equals(token) ||
+                !Results.active(owner.pending, now))
+            throw new IllegalStateException("No live request");
+        return owner;
+    }
+
     synchronized void attachAdb(Runnable cancelUi) {
         if (network || attached) throw new IllegalStateException("Already attached");
         this.cancelUi = cancelUi;

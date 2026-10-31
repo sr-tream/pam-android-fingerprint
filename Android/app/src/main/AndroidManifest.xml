@@ -30,10 +30,14 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+        <receiver android:name=".RequestActionReceiver" android:exported="false" />
         <activity android:name=".DisplayPreviewActivity" android:exported="false"
             android:configChanges="orientation|screenSize"
             android:excludeFromRecents="true" />
         <activity android:name=".AuthActivity" android:exported="true"
+            android:taskAffinity="com.randiny_games.fingerprintauthenticator.entry"
+            android:excludeFromRecents="true" />
+        <activity android:name=".ConfirmationActivity" android:exported="false"
             android:taskAffinity="com.randiny_games.fingerprintauthenticator.authentication"
             android:allowTaskReparenting="false"
             android:configChanges="orientation|screenSize"

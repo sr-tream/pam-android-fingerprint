@@ -113,9 +113,9 @@ public final class LifecycleCheck {
             subprocess.run(["java", "-cp", str(base),
                             "com.randiny_games.fingerprintauthenticator.LifecycleCheck"],
                            check=True, capture_output=True, timeout=15)
-        service = (source / "NetworkService.java").read_text()
-        self.assertIn('setData(Uri.parse("pam-network:" + owner.token))', service)
-        self.assertIn("notifications.notify(owner.token,", service)
+        service = (source / "RequestUi.java").read_text()
+        self.assertIn('identity = Uri.parse("pam-confirm:" + owner.token)', service)
+        self.assertIn("manager.notify(owner.token,", service)
         self.assertNotIn("cancel(nonce,", service)
 
     def test_raw_tls_signing_never_changes_biometric_key_policy(self):

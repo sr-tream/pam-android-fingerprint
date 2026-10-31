@@ -42,6 +42,14 @@ SSH_HINTS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
 MAX_CALLER_ENV = 65536
 
 
+class AdbTarget:
+    """A registered endpoint with a deliberate broker-owned client HOME."""
+    def __init__(self, endpoint, home):
+        if not DEVICE.fullmatch(endpoint):
+            raise ValueError("Invalid ADB endpoint")
+        self.endpoint, self.home = endpoint, home
+
+
 class NetworkUnavailable(ConnectionError):
     """Only a pre-TLS TCP connection failure permits trying another route."""
 
@@ -148,8 +156,7 @@ class NetworkConnection:
         except OSError as error:
             raw.close()
             if isinstance(error, TimeoutError) or error.errno in (
-                    errno.ECONNREFUSED, errno.ETIMEDOUT, errno.EHOSTUNREACH,
-                    errno.ENETUNREACH, errno.ENETDOWN, errno.EHOSTDOWN):
+                    errno.ECONNREFUSED, errno.ETIMEDOUT):
                 raise NetworkUnavailable("Phone TCP endpoint is unreachable") from error
             raise ValueError("Phone TCP connection failed locally; refusing fallback") from error
         except BaseException:
@@ -349,7 +356,7 @@ class BrokerConnection:
                 raise PermissionError("Broker listener was not created by the system manager")
             ipc_send(peer, dict(v=1, op="connect", phone=device["label"]))
             frames = IpcFrames(peer)
-            value = frames.read(time.monotonic() + 6, lifetime)
+            value = frames.read(time.monotonic() + 10, lifetime)
             if set(value) != {"v", "op"}:
                 raise ValueError("Invalid broker connection reply")
             if value["op"] == "unavailable":
@@ -520,13 +527,15 @@ def verify_signature(response, nonce, host, user, service, der, key):
     return der
 
 
-def adb(device, *args, timeout=4, lifetime=None, on_tick=None, deadline_check=None):
+def adb(device, *args, timeout=4, lifetime=None, on_tick=None, deadline_check=None, home=None):
     # Never start an ADB server as root or inherit caller-controlled ADB settings.
     if lifetime is not None:
         lifetime.check()
     with socket.create_connection(("127.0.0.1", 5037), timeout=1):
         pass
     command = ["/usr/bin/adb", "-H", "127.0.0.1", "-P", "5037"]
+    if isinstance(device, AdbTarget):
+        home, device = device.home, device.endpoint
     if device is not None:
         if not DEVICE.fullmatch(device):
             raise ValueError("Invalid ADB transport")
@@ -534,7 +543,7 @@ def adb(device, *args, timeout=4, lifetime=None, on_tick=None, deadline_check=No
     command.extend(args)
     # ADB creates HOME/.android even when merely connecting to an existing
     # server. Use the effective account's passwd entry, never caller HOME.
-    environment = dict(ENV, HOME=pwd.getpwuid(os.geteuid()).pw_dir)
+    environment = dict(ENV, HOME=pwd.getpwuid(os.geteuid()).pw_dir if home is None else home)
     # Bound both streams while reading, not after an unbounded communicate().
     with subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
@@ -705,10 +714,10 @@ class RequestLease:
         self.check()
 
 
-def request_response(device, transport, host, user, service, lifetime=None):
+def request_response(device, transport, host, user, service, lifetime=None, nonce=None):
     if lifetime is None:
         with RequestLifetime() as owned:
-            return request_response(device, transport, host, user, service, owned)
+            return request_response(device, transport, host, user, service, owned, nonce)
     if isinstance(transport, (NetworkConnection, BrokerConnection)):
         return transport.response(host, user, service, lifetime)
     field(service)
@@ -719,7 +728,9 @@ def request_response(device, transport, host, user, service, lifetime=None):
                  timeout=2, lifetime=lifetime).decode().strip()
     if serial != device["serial"]:
         raise ValueError("Connected device is not the selected paired phone")
-    nonce = secrets.token_hex(32)
+    nonce = secrets.token_hex(32) if nonce is None else nonce
+    if not isinstance(nonce, str) or not NONCE.fullmatch(nonce):
+        raise ValueError("Invalid request nonce")
     finished = False
     try:
         extra = ("--es", "control", "leased-v1") if persistent else ()
@@ -753,6 +764,38 @@ def request_response(device, transport, host, user, service, lifetime=None):
                 pass
 
 
+def select_adb(device, lifetime=None, home=None, connected=None, serials=None):
+    """Preflight only; never launch a prompt or connect an unregistered endpoint."""
+    if connected is None:
+        try:
+            output = adb(None, "devices", timeout=2, lifetime=lifetime, home=home).decode()
+        except (ConnectionRefusedError, TimeoutError) as error:
+            raise NetworkUnavailable("Existing ADB server is unavailable") from error
+        connected = []
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == "device" and DEVICE.fullmatch(parts[0]):
+                connected.append(parts[0])
+        if len(connected) > 8:
+            raise ValueError("Too many connected transports")
+    serials = {} if serials is None else serials
+    candidates = sorted(connected, key=lambda endpoint: (
+        endpoint not in device.get("endpoints", []), endpoint != device["serial"], endpoint))
+    for endpoint in candidates:
+        target = endpoint if home is None else AdbTarget(endpoint, home)
+        if endpoint not in serials:
+            try:
+                serials[endpoint] = adb(target, "shell", "getprop", "ro.serialno",
+                                        timeout=2, lifetime=lifetime).decode().strip()
+            except RequestCancelled:
+                raise
+            except (OSError, ValueError, subprocess.SubprocessError):
+                serials[endpoint] = None
+        if serials[endpoint] == device["serial"]:
+            return target
+    raise NetworkUnavailable("Selected paired phone is not connected through ADB")
+
+
 def choose_device(config, label=None, lifetime=None):
     """Use the first available paired identity; never prompt an unknown phone."""
     devices = config["devices"]
@@ -763,10 +806,13 @@ def choose_device(config, label=None, lifetime=None):
     connected = None
     serials = {}
     for device in devices:
+        if "broker_socket" in config:
+            try:
+                return device, BrokerConnection.connect(config, device, lifetime)
+            except NetworkUnavailable:
+                continue  # The broker has already applied the per-phone fallback policy.
         if "network" in device:
             try:
-                if "broker_socket" in config:
-                    return device, BrokerConnection.connect(config, device, lifetime)
                 return device, NetworkConnection.connect(
                     device["network"], config["network_identity"], lifetime)
             except NetworkUnavailable:
@@ -785,22 +831,10 @@ def choose_device(config, label=None, lifetime=None):
                         connected.append(parts[0])
                 if len(connected) > 8:
                     raise ValueError("Too many connected transports")
-        # Hints improve speed; the serial and mandatory pinned key remain the
-        # identity. Enumerating also supports a changed wireless IP or USB.
-        candidates = sorted(connected, key=lambda endpoint: (
-            endpoint not in device.get("endpoints", []),
-            endpoint != device["serial"], endpoint))
-        for endpoint in candidates:
-            if endpoint not in serials:
-                try:
-                    serials[endpoint] = adb(endpoint, "shell", "getprop",
-                                            "ro.serialno", timeout=2, lifetime=lifetime).decode().strip()
-                except RequestCancelled:
-                    raise
-                except (OSError, ValueError, subprocess.SubprocessError):
-                    serials[endpoint] = None
-            if serials[endpoint] == device["serial"]:
-                return device, endpoint
+        try:
+            return device, select_adb(device, lifetime, connected=connected, serials=serials)
+        except NetworkUnavailable:
+            continue
     raise ValueError("No paired phone is connected")
 
 

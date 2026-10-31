@@ -10,6 +10,7 @@ import android.view.View;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import android.widget.Button;
 
 /** Request context within an optional user-selected usable screen rectangle. */
 final class AuthScreen {
@@ -19,6 +20,8 @@ final class AuthScreen {
     private final TextView identity;
     private final TextView status;
     private final TextView remaining;
+    private final LinearLayout card;
+    private Button resume;
 
     AuthScreen(Activity activity) {
         this.activity = activity;
@@ -42,7 +45,7 @@ final class AuthScreen {
         }
         FrameLayout root = new FrameLayout(activity);
         root.setBackgroundColor(Color.BLACK);
-        LinearLayout card = new LinearLayout(activity);
+        card = new LinearLayout(activity);
         card.setOrientation(LinearLayout.VERTICAL);
         int pad = dp(compact ? 5 : 24);
         card.setPadding(pad, pad, pad, pad);
@@ -127,4 +130,24 @@ final class AuthScreen {
                 success ? Color.rgb(130, 255, 170) : Color.rgb(255, 190, 110));
         remaining.setText(success ? "PC sign-in" : "Use PC password");
     }
+
+    void controls(boolean unlimited, Runnable scan, Runnable cancel) {
+        if (!unlimited) return;
+        LinearLayout actions = new LinearLayout(activity);
+        resume = new Button(activity);
+        resume.setText("Resume");
+        resume.setTextSize(compact ? 8 : 14);
+        resume.setPadding(0, 0, 0, 0);
+        resume.setOnClickListener(v -> scan.run());
+        Button end = new Button(activity);
+        end.setText("Cancel");
+        end.setTextSize(compact ? 8 : 14);
+        end.setPadding(0, 0, 0, 0);
+        end.setOnClickListener(v -> cancel.run());
+        actions.addView(resume, new LinearLayout.LayoutParams(0, -1, 1));
+        actions.addView(end, new LinearLayout.LayoutParams(0, -1, 1));
+        card.addView(actions, new LinearLayout.LayoutParams(-1, dp(compact ? 24 : 48)));
+    }
+
+    void scanning(boolean value) { if (resume != null) resume.setEnabled(!value); }
 }
