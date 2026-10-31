@@ -9,6 +9,30 @@ TOTP implementation has been replaced. This fork is experimental: review it
 before using it in an authentication stack. **No automatic PAM installer is
 provided. Password fallback must remain available.**
 
+## Changes in this fork
+
+* Replaced Python 2, `pam_python`, HTTP and TOTP with Python 3 and signed
+  challenge–response over an existing authorized ADB connection. No phone
+  network listener or Internet permission.
+* Added pinned P-256 Android Keystore keys with hardware-enforced, per-use
+  strong-biometric authorization. Signatures bind a fresh nonce, computer,
+  Linux user and PAM service; there is no phone PIN fallback.
+* Added explicit pairing and multiple independent phone keys for one Linux
+  user. The first connected enrolled phone is selected; requests are not
+  broadcast and cancellation does not automatically try another phone.
+* Added configurable confirmation areas and forced orientation for damaged
+  screens, plus public-key SHA256 Copy/Share with security confirmations,
+  eight-character hyphenated groups and high-contrast symbol colors.
+* Added KDE's dedicated fingerprint PAM example for automatic unlock,
+  request-lifetime cancellation and renewable phone leases without an overall
+  fingerprint deadline. Ordinary sudo/Polkit requests remain time-limited.
+* Added optional KDE Wayland monitor wake after unlock, a narrowly scoped
+  socket-activated Polkit sandbox example, and best-effort SSH hints that let
+  sudo skip phone waiting and continue to the normal password path.
+* Added an offline Android SDK build, protocol/UI-data regression tests,
+  isolated Linux-PAM fixtures and manual verification/rollback guidance.
+  PAM integration remains manual and distribution-specific.
+
 ## Requirements
 
 * Android 11 / API 30 or newer, an enrolled strong biometric and a hardware-backed
@@ -18,10 +42,12 @@ provided. Password fallback must remain available.**
   authorized ADB server at `127.0.0.1:5037`.
 * For building: JDK 17, Android SDK platform 36 and build-tools 36.0.0.
 
-The SDK build and basic pairing/fresh-touch verification have been exercised
-on Android 14. Other devices, locked/folded states and PAM service configurations
-require separate validation. Multi-phone selection has automated coverage;
-two physical phones have not yet been tested together.
+The SDK build and pairing/fresh-touch verification have been exercised on
+Android 11 and 14. Two physical phones have been enrolled and connected together
+for a real PAM request. KDE unlock/cancellation, monitor wake, Polkit fingerprint
+authorization and password fallback have been exercised on one Arch/KDE setup.
+Other devices, locked/folded states and PAM service configurations require
+separate validation; these examples are not universal compatibility guarantees.
 
 ## Build
 
@@ -55,7 +81,7 @@ Each button asks for confirmation; sharing opens Android's app chooser, where
 you can select KDE Connect or another installed app.
 
 The phone also colors digits blue, `a/e` amber and `b/c/d/f` purple, with lighter
-shades for higher symbols within each group. Colors are an optional visual cue,
+shades for higher symbols within each group. Colors are an additional visual cue,
 not verification data: the complete text stays visible and Copy/Share contain
 plain text only. The fingerprint panel uses a fixed light background and colors
 tested for at least 4.5:1 text contrast.
